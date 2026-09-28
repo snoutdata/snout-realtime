@@ -20,7 +20,8 @@ every project on a SnoutData Cloud host.
   they are sparse. Each subscriber's filters are checked in the project's database, each in its
   own subtransaction; then its row-level security, as the subscriber, once per distinct set of
   claims for the whole batch (a thousand subscribers who are the same user cost one check, a
-  busy table one check per batch rather than per change), each check its own statement, so a
+  busy table one check per batch rather than per change), shared between two connections once
+  a project has many subscribers, each check its own statement, so a
   policy that raises for one subscriber costs that subscriber alone. What a subscriber sees of the
   row is what its role may select.
 - **Broadcast from the database.** A row written to `realtime.messages` (by `realtime.send()` or

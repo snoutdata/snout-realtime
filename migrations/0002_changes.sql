@@ -5,7 +5,7 @@
 --
 -- The server streams the project's changes itself (pgoutput) and decides them in BATCHES: every
 -- change to one table, of one kind, that has arrived and not been decided yet (one when changes
--- are sparse, as many as have queued when they are not). For each batch, on a connection of its
+-- are sparse, as many as have queued when they are not). For each batch, on connections of its
 -- own:
 --
 --  1. decide_changes() answers, in one call, everything that does not need the subscriber's
@@ -17,8 +17,9 @@
 --     anything not asked for, a DELETE on a table with row-level security carrying only the key
 --     (a deleted row cannot be checked).
 --  2. The server runs the check AS each group (its role, its claims in request.jwt.claims), once
---     per distinct set of claims for the WHOLE batch, prepared once, all of a role's checks
---     pipelined in one round trip, each its own statement. Ten thousand anonymous subscribers
+--     per distinct set of claims for the WHOLE batch, prepared once, a role's checks pipelined in
+--     one round trip per connection (a second shares them once a project has many subscribers),
+--     each its own statement. Ten thousand anonymous subscribers
 --     cost one check, a thousand users a thousand runs of one plan, a policy that raises costs
 --     its group alone, and a busy table costs a check per batch rather than per change.
 
@@ -30,19 +31,6 @@ create table if not exists snout_realtime.migrations (
 	applied_at timestamptz not null default now()
 );
 
--- One column of the table, with the change's value for it (new, and old where there is one).
-do $body$
-begin
-	if to_regtype('snout_realtime.change_column') is null then
-		create type snout_realtime.change_column as (
-			name text, attnum int, type_text text, type_name text, is_pkey boolean,
-			new_present boolean, new_value jsonb, new_raw text,
-			old_present boolean, old_value jsonb, old_raw text
-		);
-	end if;
-end
-$body$;
-
 -- What earlier versions of this file made, and the server no longer calls. decide_changes is
 -- dropped too, since `create or replace` cannot change what a function returns.
 drop function if exists snout_realtime.apply_change(regclass, text, timestamptz, jsonb, jsonb, integer);
@@ -52,6 +40,33 @@ drop function if exists snout_realtime.change_subscribers(regclass, text, timest
 drop function if exists snout_realtime.json_value(text, text);
 drop function if exists snout_realtime.decide_changes(regclass, text, timestamptz[], jsonb[], jsonb[], integer);
 drop type if exists snout_realtime.row_subscriber;
+drop function if exists snout_realtime.change_columns(regclass, jsonb, jsonb);
+drop type if exists snout_realtime.change_column;
+
+-- Wait until the transactions a batch's changes came from are visible to a new snapshot, for up
+-- to a second. A change is streamed once its commit is in the WAL, which is a moment before the
+-- committing transaction stops being in progress for everyone else; a row check that ran in that
+-- moment would not find the row. `xids` are the 32-bit ids the stream carries, read as the
+-- latest ones they can be.
+create or replace function snout_realtime.await_visible(xids bigint[]) returns void
+	language plpgsql volatile
+	as $body$
+declare
+	until_ timestamptz := clock_timestamp() + interval '1 second';
+begin
+	loop
+		exit when not exists (
+			select 1 from unnest(xids) x,
+				lateral (select pg_snapshot_xmax(pg_current_snapshot())::text::bigint as xmax) s,
+				lateral (select (s.xmax & ~4294967295::bigint) | x as full_) f
+			where not pg_visible_in_snapshot(
+				(case when f.full_ > s.xmax then f.full_ - 4294967296 else f.full_ end)::text::xid8,
+				pg_current_snapshot()));
+		exit when clock_timestamp() > until_;
+		perform pg_sleep(0.001);
+	end loop;
+end
+$body$;
 
 -- Does a filter hold for a value, both read as the column's type?
 create or replace function snout_realtime.filter_holds(op realtime.equality_op, type_text text, value text, operand text) returns boolean
@@ -66,43 +81,6 @@ begin
 	execute format('select %L::%s %s (%L::%s)', value, type_text, symbol, operand,
 		case when op = 'in' then type_text || '[]' else type_text end) into res;
 	return res;
-end
-$body$;
-
--- The table's columns, with a change's values. The values arrive as the text Postgres printed;
--- each is read as its column's type by making the row once (jsonb_populate_record), json and
--- jsonb read as the JSON they hold first, so the record carries the value a select would.
-create or replace function snout_realtime.change_columns(entity_ regclass, new_values jsonb, old_values jsonb)
-	returns snout_realtime.change_column[]
-	language plpgsql stable
-	as $body$
-declare
-	json_cols text[] := array(
-		select a.attname from pg_attribute a
-		where a.attrelid = entity_ and a.attnum > 0 and not a.attisdropped
-		  and a.atttypid in ('json'::regtype, 'jsonb'::regtype));
-	n jsonb := coalesce(new_values, '{}');
-	o jsonb := coalesce(old_values, '{}');
-	new_typed jsonb;
-	old_typed jsonb;
-begin
-	if cardinality(json_cols) > 0 then
-		n := n || coalesce((select jsonb_object_agg(k, (n ->> k)::jsonb) from unnest(json_cols) k where n ->> k is not null), '{}');
-		o := o || coalesce((select jsonb_object_agg(k, (o ->> k)::jsonb) from unnest(json_cols) k where o ->> k is not null), '{}');
-	end if;
-	execute format('select to_jsonb(jsonb_populate_record(null::%s, $1)), to_jsonb(jsonb_populate_record(null::%s, $2))', entity_, entity_)
-		into new_typed, old_typed using n, o;
-	return (
-		select coalesce(array_agg(row(a.attname, a.attnum, format_type(a.atttypid, a.atttypmod), t.typname,
-			exists (select 1 from pg_constraint k where k.conrelid = entity_ and k.contype = 'p' and a.attnum = any (k.conkey)),
-			-- A NULL stays SQL NULL, not the JSON null the made row holds, so an oversized record
-			-- leaves it out as it leaves out every value it cannot carry.
-			new_values ? a.attname, nullif(new_typed -> a.attname, 'null'::jsonb), new_values ->> a.attname,
-			old_values ? a.attname, nullif(old_typed -> a.attname, 'null'::jsonb), old_values ->> a.attname
-		)::snout_realtime.change_column order by a.attnum), '{}')
-		from pg_attribute a join pg_type t on t.oid = a.atttypid
-		where a.attrelid = entity_ and a.attnum > 0 and not a.attisdropped
-	);
 end
 $body$;
 
@@ -154,10 +132,27 @@ declare
 	g record;
 	i integer;
 	seen integer[];
-	-- Every subscriber who may see something, of every role: the payloads are made for them.
-	candidates uuid[] := '{}';
-	groups_ record;
-	cols snout_realtime.change_column[];
+	-- Who may see something, of every role (the payloads are made for them): every subscriber
+	-- without filters of the roles in `roles_on`, and those with filters in `passed`. Kept as
+	-- the two, not one list of ids, since a list tested against every row is a plan that the
+	-- table's statistics can make quadratic.
+	roles_on regrole[] := '{}';
+	passed uuid[] := '{}';
+	any_candidate boolean := false;
+	-- The columns, in order: name, attnum, and the name of their type.
+	cols jsonb := (
+		select jsonb_agg(jsonb_build_object('name', a.attname, 'attnum', a.attnum, 'type_name', t.typname) order by a.attnum)
+		from pg_attribute a join pg_type t on t.oid = a.atttypid
+		where a.attrelid = entity_ and a.attnum > 0 and not a.attisdropped);
+	json_cols text[] := array(
+		select a.attname from pg_attribute a
+		where a.attrelid = entity_ and a.attnum > 0 and not a.attisdropped
+		  and a.atttypid in ('json'::regtype, 'jsonb'::regtype));
+	-- Per group: its number, the columns it may be shown, and the 'columns' it is sent.
+	shown jsonb := '[]';
+	one jsonb;
+	typed_new jsonb[];
+	typed_old jsonb[];
 	too_big boolean;
 	stamp text;
 	body jsonb;
@@ -235,14 +230,16 @@ begin
 				seen := '{}';
 			end;
 			if cardinality(seen) > 0 then
-				candidates := candidates || sub.subscription_id;
+				passed := passed || sub.subscription_id;
+				any_candidate := true;
 				return query select 'row', e, null::integer, rolname_, null::text, array[sub.subscription_id],
 						null::jsonb, null::text[], null::text, null::jsonb, null::integer[]
 					from unnest(seen) e;
 			end if;
 		end loop;
-		candidates := candidates || array(
-			select s.subscription_id from realtime.subscription s
+		roles_on := roles_on || role_;
+		any_candidate := any_candidate or exists (
+			select 1 from realtime.subscription s
 			where s.entity = entity_ and s.claims_role = role_ and (s.action_filter = '*' or s.action_filter = action)
 			  and coalesce(cardinality(s.filters), 0) = 0);
 
@@ -253,7 +250,7 @@ begin
 					null::jsonb, null::text[], null::text, null::jsonb, null::integer[]
 				from realtime.subscription s
 				where s.entity = entity_ and s.claims_role = role_ and (s.action_filter = '*' or s.action_filter = action)
-				  and s.subscription_id in (select unnest(candidates))
+				  and (coalesce(cardinality(s.filters), 0) = 0 or s.subscription_id = any (passed))
 				group by s.claims;
 		end if;
 	end loop;
@@ -266,68 +263,77 @@ begin
 				entity_, (select string_agg(format('%I = ($2::jsonb -> 0 ->> %L)::%s', c, c, col_types ->> c), ' and ') from unnest(pk) c)),
 			batch_keys, eligible;
 	elsif checked then
+		-- One index probe per key: a LATERAL with a LIMIT cannot become a join, and a join is
+		-- what the planner otherwise picks, reading the whole table to hash it, for every check.
 		return query select 'keys', null::integer, null::integer, null::text, null::text, null::uuid[], null::jsonb, null::text[],
-			format('select coalesce(array_agg(k.i::integer), ''{}'') from jsonb_array_elements($2) with ordinality k(v, i) where exists (select 1 from %s where %s)',
+			format('select coalesce(array_agg(k.i::integer), ''{}'') from jsonb_array_elements($2) with ordinality k(v, i) cross join lateral (select from %s where %s limit 1) f',
 				entity_, (select string_agg(format('%I = (k.v ->> %L)::%s', c, c, col_types ->> c), ' and ') from unnest(pk) c)),
 			batch_keys, eligible;
 	end if;
 
-	-- The groups, once for the batch, and what each sees of each change.
-	for groups_ in
+	-- The groups, once for the batch, each with the columns it may be shown: those its role may
+	-- select, less any it did not ask for (the key is always kept).
+	for g in
 		select row_number() over (order by s.claims_role::text, s.selected_columns nulls first)::integer as no,
 			s.claims_role as role_, s.selected_columns as group_columns, array_agg(s.subscription_id) as ids
 		from realtime.subscription s
-		where s.subscription_id in (select unnest(candidates))
+		where s.entity = entity_ and (s.action_filter = '*' or s.action_filter = action) and s.claims_role = any (roles_on)
+		  and (coalesce(cardinality(s.filters), 0) = 0 or s.subscription_id = any (passed))
 		group by s.claims_role, s.selected_columns
 	loop
-		return query select 'group', null::integer, groups_.no, null::text, null::text, groups_.ids,
+		return query select 'group', null::integer, g.no, null::text, null::text, g.ids,
 			null::jsonb, null::text[], null::text, null::jsonb, null::integer[];
+		shown := shown || jsonb_build_array(jsonb_build_object(
+			'no', g.no,
+			'names', coalesce((select jsonb_agg(c.name order by c.attnum) from jsonb_to_recordset(cols) c(name text, attnum integer, type_name text)
+				where pg_catalog.has_column_privilege(g.role_, entity_, c.name, 'SELECT')
+				  and (g.group_columns is null or c.name = any (g.group_columns) or c.name = any (pk))), '[]'),
+			'columns', (select jsonb_agg(jsonb_build_object('name', c.name, 'type', c.type_name) order by c.attnum) from jsonb_to_recordset(cols) c(name text, attnum integer, type_name text)
+				where pg_catalog.has_column_privilege(g.role_, entity_, c.name, 'SELECT')
+				  and (g.group_columns is null or c.name = any (g.group_columns) or c.name = any (pk)))));
 	end loop;
-	if cardinality(candidates) = 0 then
+	if not any_candidate then
 		return;
 	end if;
+
+	-- Every change's values, read as its columns are typed, in one call for the batch: the text
+	-- Postgres printed made into a row (json and jsonb read as the JSON they hold first), so each
+	-- carries the value a select would. A NULL stays SQL NULL, not the JSON null the made row
+	-- holds, so an oversized record leaves it out as it leaves out every value it cannot carry.
+	execute format('select array_agg(to_jsonb(jsonb_populate_record(null::%1$s, u.n)) order by u.o), '
+			'array_agg(to_jsonb(jsonb_populate_record(null::%1$s, u.d)) order by u.o) '
+			'from unnest($1, $2) with ordinality u(n, d, o)', entity_)
+		into typed_new, typed_old
+		using
+			array(select coalesce(v, '{}') || coalesce((select jsonb_object_agg(k, (v ->> k)::jsonb) from unnest(json_cols) k where v ->> k is not null), '{}')
+				from unnest(new_values) with ordinality u(v, o) order by o),
+			array(select coalesce(v, '{}') || coalesce((select jsonb_object_agg(k, (v ->> k)::jsonb) from unnest(json_cols) k where v ->> k is not null), '{}')
+				from unnest(coalesce(old_values, array_fill(null::jsonb, array[n]))) with ordinality u(v, o) order by o);
+
 	foreach i in array eligible loop
-		cols := snout_realtime.change_columns(entity_, new_values[i], old_values[i]);
 		too_big := octet_length(coalesce(new_values[i]::text, '')) + octet_length(coalesce(old_values[i]::text, '')) > max_record_bytes;
 		stamp := to_char(commit_times[i] at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
-		for g in
-			select row_number() over (order by s.claims_role::text, s.selected_columns nulls first)::integer as no,
-				s.claims_role as role_, s.selected_columns as group_columns
-			from realtime.subscription s
-			where s.subscription_id in (select unnest(candidates))
-			group by s.claims_role, s.selected_columns
-		loop
-			body := head || jsonb_build_object(
-				'commit_timestamp', stamp,
-				'columns', (
-					select jsonb_agg(jsonb_build_object('name', c.name, 'type', c.type_name) order by c.attnum)
-					from unnest(cols) c
-					where pg_catalog.has_column_privilege(g.role_, entity_, c.name, 'SELECT')
-					  and (g.group_columns is null or c.name = any (g.group_columns) or c.is_pkey)
-				)
-			);
+		for one in select value from jsonb_array_elements(shown) loop
+			body := head || jsonb_build_object('commit_timestamp', stamp, 'columns', one -> 'columns');
 			if action in ('INSERT', 'UPDATE') then
 				body := body || jsonb_build_object('record', (
-					select jsonb_object_agg(c.name, case when c.new_present then c.new_value else c.old_value end)
-					from unnest(cols) c
-					where (c.new_present or c.old_present)
-					  and pg_catalog.has_column_privilege(g.role_, entity_, c.name, 'SELECT')
-					  and (g.group_columns is null or c.name = any (g.group_columns) or c.is_pkey)
-					  and (not too_big or octet_length((case when c.new_present then c.new_value else c.old_value end)::text) <= 64)
+					select jsonb_object_agg(c, v.value)
+					from jsonb_array_elements_text(one -> 'names') c,
+						lateral (select case when new_values[i] ? c then nullif(typed_new[i] -> c, 'null'::jsonb) else nullif(typed_old[i] -> c, 'null'::jsonb) end as value) v
+					where (new_values[i] ? c or old_values[i] ? c)
+					  and (not too_big or octet_length(v.value::text) <= 64)
 				));
 			end if;
 			if action in ('UPDATE', 'DELETE') then
 				body := body || jsonb_build_object('old_record', (
-					select jsonb_object_agg(c.name, c.old_value)
-					from unnest(cols) c
-					where c.old_present
-					  and pg_catalog.has_column_privilege(g.role_, entity_, c.name, 'SELECT')
-					  and (g.group_columns is null or c.name = any (g.group_columns) or c.is_pkey)
-					  and (not too_big or octet_length(c.old_value::text) <= 64)
-					  and (action <> 'DELETE' or not rls or c.is_pkey)
+					select jsonb_object_agg(c, nullif(typed_old[i] -> c, 'null'::jsonb))
+					from jsonb_array_elements_text(one -> 'names') c
+					where old_values[i] ? c
+					  and (not too_big or octet_length(nullif(typed_old[i] -> c, 'null'::jsonb)::text) <= 64)
+					  and (action <> 'DELETE' or not rls or c = any (pk))
 				));
 			end if;
-			return query select 'payload', i, g.no, null::text, null::text, null::uuid[], body,
+			return query select 'payload', i, (one ->> 'no')::integer, null::text, null::text, null::uuid[], body,
 				case when too_big then array['Error 413: Payload Too Large'] else '{}'::text[] end,
 				null::text, null::jsonb, null::integer[];
 		end loop;

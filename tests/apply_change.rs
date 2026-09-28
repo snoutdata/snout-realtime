@@ -37,6 +37,10 @@ async fn database() -> Option<Client> {
 	};
 	let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
 	tokio::spawn(connection);
+	// The second connection the checks are shared with, as the stream opens one for many users.
+	let (second, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+	tokio::spawn(connection);
+	SECOND.with(|s| *s.borrow_mut() = Some(second));
 	client
 		.batch_execute(
 			"create schema auth;
@@ -101,12 +105,14 @@ async fn subscribe(
 }
 
 thread_local! {
-	static STATEMENTS: std::cell::RefCell<snout_realtime::changes::Statements> = Default::default();
+	static STATEMENTS: std::cell::RefCell<Vec<snout_realtime::changes::Statements>> = std::cell::RefCell::new(vec![Default::default(), Default::default()]);
+	static SECOND: std::cell::RefCell<Option<Client>> = Default::default();
 }
 
 /// A batch of changes to one table: for each group, (change's position, subscription ids
-/// sorted, payload, errors). One connection for the whole test, as the stream keeps one, so the
-/// prepared row checks are reused across calls, tables and roles.
+/// sorted, payload, errors). Two connections for the whole test, as the stream keeps them, so the
+/// prepared row checks are reused across calls, tables and roles, and a role's users are shared
+/// between the two.
 async fn batch(
 	db: &Client,
 	table: &str,
@@ -118,19 +124,28 @@ async fn batch(
 		.await
 		.unwrap()
 		.get(0);
+	// A transaction that has committed, as a change carries its own, so the checks wait for it.
+	let xid: i64 = db
+		.query_one("select pg_current_xact_id()::text::bigint % 4294967296", &[])
+		.await
+		.unwrap()
+		.get(0);
 	let changes: Vec<snout_realtime::changes::Change> = changes
 		.iter()
 		.map(|(new, old)| snout_realtime::changes::Change {
 			commit_seconds: 1_790_000_000.0,
+			xid: xid as u32,
 			new: new.clone(),
 			old: old.clone(),
 		})
 		.collect();
 	let mut statements = STATEMENTS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+	let second = SECOND.with(|s| s.borrow_mut().take()).unwrap();
 	let groups =
-		snout_realtime::changes::decide(db, &mut statements, oid, action, &changes, 1_048_576)
+		snout_realtime::changes::decide(&[db, &second], &mut statements, oid, action, &changes, 1_048_576)
 			.await
 			.unwrap();
+	SECOND.with(|s| *s.borrow_mut() = Some(second));
 	STATEMENTS.with(|s| *s.borrow_mut() = statements);
 	let mut out: Vec<_> = groups
 		.into_iter()
