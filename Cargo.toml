@@ -1,0 +1,65 @@
+[package]
+name = "snout-realtime"
+description = "snout-realtime: broadcast, presence and database changes over WebSockets, with row-level security deciding who sees what."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/snoutdata/snout-realtime"
+rust-version = "1.98.1"
+publish = false
+
+[[bin]]
+name = "snout-realtime"
+path = "src/main.rs"
+
+[dependencies]
+# The server: one port for sockets, the tenant API and metrics.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query", "ws"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
+# Postgres: each project's own database (authorisation as the caller, subscriptions, changes)
+# and the metadata database that holds the tenants.
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-uuid-1"] }
+deadpool-postgres = "0.14"
+# The replication stream (replication.rs): the codec tokio-postgres itself uses.
+postgres-protocol = "0.6"
+fallible-iterator = "0.2"
+bytes = "1"
+
+# Tokens (jwt.rs) and the tenants' secrets at rest (tenants.rs).
+hmac = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+base64 = "0.22"
+getrandom = "0.4"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+uuid = { version = "1", features = ["v1", "v4", "serde"] }
+percent-encoding = "2"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "ansi"] }
+
+
+# Written out from the stack workspace by scripts/assemble.sh.
+[lints.rust]
+# X13: no `unsafe` outside the pgrx boundary. The three extensions under ext/ opt out in
+# their own Cargo.toml when pgrx arrives, and nowhere else may.
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Its own workspace: this repository is not part of any other.
+[workspace]
