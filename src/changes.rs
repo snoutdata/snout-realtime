@@ -482,9 +482,10 @@ impl Changes {
 		))
 		.await
 		.map_err(|e| e.to_string())?;
-		let checker = self.checker().await?;
-		let mut statements = Statements::new();
-		match self.sweep(&checker).await {
+		// The first connection for the checks; a second joins it once there are many subscribers.
+		let mut checkers = vec![self.checker().await?];
+		let mut statements = vec![Statements::new()];
+		match self.sweep(&checkers[0]).await {
 			Ok(0) => {}
 			Ok(n) => {
 				tracing::info!(tenant = %rt.id, rows = n, "subscriptions left by an earlier server removed")
@@ -496,6 +497,7 @@ impl Changes {
 		self.ready.notify_waiters();
 		let mut relations: HashMap<u32, Relation> = HashMap::new();
 		let mut commit_time: i64 = 0;
+		let mut xid: u32 = 0;
 		let mut idle_since: Option<std::time::Instant> = None;
 		// Changes read and not decided yet, all to one table and of one kind, and the commit to
 		// acknowledge once they are.
@@ -509,7 +511,7 @@ impl Changes {
 				match futures_util::FutureExt::now_or_never(conn.next()) {
 					Some(e) => e.map_err(|e| e.to_string())?,
 					None => {
-						self.flush(rt, &checker, &mut statements, &relations, &mut batch)
+						self.flush(rt, &mut checkers, &mut statements, &relations, &mut batch)
 							.await?;
 						if let Some(lsn) = ack.take() {
 							conn.ack(lsn).await.map_err(|e| e.to_string())?;
@@ -536,7 +538,7 @@ impl Changes {
 			match event {
 				Event::Keepalive { end_lsn, reply } => {
 					if reply {
-						self.flush(rt, &checker, &mut statements, &relations, &mut batch)
+						self.flush(rt, &mut checkers, &mut statements, &relations, &mut batch)
 							.await?;
 						conn.ack(ack.take().unwrap_or(0).max(end_lsn))
 							.await
@@ -547,13 +549,18 @@ impl Changes {
 					let (relation, action, new, old) = match pgoutput::decode(data)
 						.map_err(|e| e.to_string())?
 					{
-						Message::Begin { commit_time: t, .. } => {
+						Message::Begin {
+							commit_time: t,
+							xid: x,
+							..
+						} => {
 							commit_time = t;
+							xid = x;
 							continue;
 						}
 						Message::Relation(r) => {
 							// A table's shape changed: what was read of it is decided first.
-							self.flush(rt, &checker, &mut statements, &relations, &mut batch)
+							self.flush(rt, &mut checkers, &mut statements, &relations, &mut batch)
 								.await?;
 							relations.insert(r.id, r);
 							continue;
@@ -578,7 +585,7 @@ impl Changes {
 					if batch.as_ref().is_some_and(|b| {
 						b.relation != relation || b.action != action || b.changes.len() >= BATCH
 					}) {
-						self.flush(rt, &checker, &mut statements, &relations, &mut batch)
+						self.flush(rt, &mut checkers, &mut statements, &relations, &mut batch)
 							.await?;
 					}
 					if !self.wanted(&r.schema, &r.name, action).await {
@@ -595,6 +602,7 @@ impl Changes {
 							r,
 							action,
 							commit_time,
+							xid,
 							new.as_deref(),
 							old.as_ref(),
 						));
@@ -604,12 +612,12 @@ impl Changes {
 	}
 
 	/// Decide a batch of changes in the project's database and send them, in the order they were
-	/// committed. An error is the checker's connection gone.
+	/// committed. An error is a checker's connection gone.
 	async fn flush(
 		&self,
 		rt: &TenantRt,
-		checker: &tokio_postgres::Client,
-		statements: &mut Statements,
+		checkers: &mut Vec<tokio_postgres::Client>,
+		statements: &mut Vec<Statements>,
 		relations: &HashMap<u32, Relation>,
 		batch: &mut Option<Batch>,
 	) -> Result<(), String> {
@@ -619,9 +627,19 @@ impl Changes {
 		if !relations.contains_key(&b.relation) {
 			return Ok(());
 		}
+		if checkers.len() < CHECKERS && self.listeners.lock().await.len() >= SHARE_FROM {
+			match self.checker().await {
+				Ok(c) => {
+					checkers.push(c);
+					statements.push(Statements::new());
+				}
+				Err(e) => tracing::warn!(tenant = %rt.id, error = %e, "a second connection for the checks"),
+			}
+		}
 		let started = std::time::Instant::now();
+		let clients: Vec<&tokio_postgres::Client> = checkers.iter().collect();
 		match decide(
-			checker,
+			&clients,
 			statements,
 			b.relation,
 			b.action,
@@ -646,7 +664,7 @@ impl Changes {
 				Ok(())
 			}
 			// The connection is gone: the stream starts again with a new one.
-			Err(e) if checker.is_closed() => Err(e.to_string()),
+			Err(e) if checkers.iter().any(|c| c.is_closed()) => Err(e.to_string()),
 			Err(e) => {
 				tracing::warn!(tenant = %rt.id, error = %e, changes = b.changes.len(), "changes could not be evaluated");
 				Ok(())
@@ -725,6 +743,11 @@ impl Changes {
 	}
 }
 
+/// The connections a project's row checks run on at most, and the subscribers it takes to open
+/// the second: a thousand users' checks take two processes half the time one takes.
+const CHECKERS: usize = 2;
+const SHARE_FROM: usize = 64;
+
 /// The most changes decided together: enough that a backlog clears in a few calls, few enough
 /// that one call stays short.
 const BATCH: usize = 500;
@@ -740,6 +763,8 @@ struct Batch {
 #[derive(Debug, Clone)]
 pub struct Change {
 	pub commit_seconds: f64,
+	/// The transaction it came from (0 for none: not waited for).
+	pub xid: u32,
 	pub new: Option<Value>,
 	pub old: Option<Value>,
 }
@@ -749,6 +774,7 @@ impl Change {
 		r: &Relation,
 		action: &str,
 		commit_time: i64,
+		xid: u32,
 		new: Option<&[pgoutput::Value]>,
 		old: Option<&Old>,
 	) -> Change {
@@ -772,6 +798,7 @@ impl Change {
 		};
 		Change {
 			commit_seconds: commit_time as f64 / 1_000_000.0 + 946_684_800.0,
+			xid,
 			new: new.map(|n| as_json(n, false)),
 			// The old row: what the stream sent (its key, or all of it), or for an update that
 			// did not change the key, the key as the new row has it.
@@ -807,12 +834,13 @@ enum Sees {
 
 /// Who may see each of a batch of changes to one table, and what: `decide_changes` in one call,
 /// then the row check as each distinct set of claims for the whole batch, one round trip per
-/// role (migrations/0002_changes.sql says why). Each group comes with its change's position in
-/// the batch, in order. `client` must be a connection of the caller's own: the checks switch its
-/// role, and it is given back before this returns.
+/// role and connection (migrations/0002_changes.sql says why). Each group comes with its change's
+/// position in the batch, in order. `clients` are connections of the caller's own, one or more,
+/// with the statements prepared on each (`statements`, as many): the checks switch their role,
+/// and it is given back before this returns. The first also answers `decide_changes`.
 pub async fn decide(
-	client: &tokio_postgres::Client,
-	statements: &mut Statements,
+	clients: &[&tokio_postgres::Client],
+	statements: &mut [Statements],
 	entity: u32,
 	action: &str,
 	changes: &[Change],
@@ -821,7 +849,7 @@ pub async fn decide(
 	let times: Vec<f64> = changes.iter().map(|c| c.commit_seconds).collect();
 	let new: Vec<Option<&Value>> = changes.iter().map(|c| c.new.as_ref()).collect();
 	let old: Vec<Option<&Value>> = changes.iter().map(|c| c.old.as_ref()).collect();
-	let rows = client
+	let rows = clients[0]
 		.query(
 			"select outcome, idx, grp, role_name, claims, subscription_ids::text[], payload, errors, check_sql, keys, rows
 			 from snout_realtime.decide_changes($1::oid::regclass, $2,
@@ -901,70 +929,106 @@ pub async fn decide(
 		}
 	}
 	if let Some((sql, keys, eligible)) = &check {
+		// The checks find the rows only once their transactions are visible, which the stream can
+		// be a moment ahead of: each connection waits for that before it takes the role.
+		let mut xids: Vec<u32> = changes.iter().map(|c| c.xid).filter(|x| *x != 0).collect();
+		xids.sort_unstable();
+		xids.dedup();
+		let visible = if xids.is_empty() {
+			String::new()
+		} else {
+			format!(
+				"select snout_realtime.await_visible('{{{}}}'); ",
+				xids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+			)
+		};
 		let wrapped = format!(
 			"with s as materialized (select set_config('request.jwt.claims', $1, true)) select ({sql}) from s"
 		);
 		for (role, claim_groups) in &checks {
-			let statement = match statements.get(&wrapped) {
-				Some(s) => s.clone(),
-				None => match client.prepare(&wrapped).await {
-					Ok(s) => {
-						statements.insert(wrapped.clone(), s.clone());
-						s
-					}
-					Err(e) => {
-						tracing::warn!(role = %role, error = %e, "a row check could not be prepared");
-						continue;
-					}
-				},
-			};
-			// One round trip: take the role (with a claims default the planner can parse, since
-			// it reads the setting when it estimates), run every check, give the role back.
-			// Requests on one connection are answered in the order they were sent.
+			// A role's claims, split across the connections there are, in order: each takes its
+			// share of the checks at once, as the database has a process per connection.
+			let share = claim_groups.len().div_ceil(clients.len().min(claim_groups.len()).max(1));
+			let shares: Vec<&[(String, Vec<String>)]> = claim_groups.chunks(share.max(1)).collect();
+			let mut prepared = Vec::with_capacity(shares.len());
+			for (n, _) in shares.iter().enumerate() {
+				let statement = match statements[n].get(&wrapped) {
+					Some(s) => Some(s.clone()),
+					None => match clients[n].prepare(&wrapped).await {
+						Ok(s) => {
+							statements[n].insert(wrapped.clone(), s.clone());
+							Some(s)
+						}
+						Err(e) => {
+							tracing::warn!(role = %role, error = %e, "a row check could not be prepared");
+							None
+						}
+					},
+				};
+				prepared.push(statement);
+			}
+			// One round trip per connection: take the role (with a claims default the planner can
+			// parse, since it reads the setting when it estimates), run every check, give the role
+			// back. Requests on one connection are answered in the order they were sent.
 			let take = format!(
-				"set role {}; select set_config('request.jwt.claims', '{{}}', false)",
+				"{visible}set role {}; select set_config('request.jwt.claims', '{{}}', false)",
 				quote_ident(role)
 			);
-			let statement = &statement;
-			let (taken, answers, given_back) = futures_util::future::join3(
-				client.batch_execute(&take),
-				futures_util::future::join_all(claim_groups.iter().map(|(claims, _)| async move {
-					client.query_one(statement, &[claims, keys]).await
-				})),
-				client.batch_execute("reset role"),
-			)
-			.await;
-			given_back?;
-			if let Err(e) = taken {
-				// The checks ran as the server itself, which no policy restrains: none counts.
-				tracing::warn!(role = %role, error = %e, "a subscriber's role cannot be taken");
-				continue;
-			}
-			for ((_, ids), answer) in claim_groups.iter().zip(answers) {
-				let positions: Vec<i32> = match answer {
-					Ok(row) => row.get::<_, Option<Vec<i32>>>(0).unwrap_or_default(),
-					Err(e) => {
-						// Prepared again next time, in case the table changed under it.
-						statements.remove(&wrapped);
-						tracing::warn!(
-							subscriptions = ids.len(),
-							error = %e,
-							"the row-level security check of a subscriber raised"
-						);
-						continue;
+			let runs = futures_util::future::join_all(shares.iter().zip(&prepared).enumerate().map(
+				|(n, (share, statement))| {
+					let (client, take) = (clients[n], &take);
+					async move {
+						let statement = statement.as_ref()?;
+						Some(
+							futures_util::future::join3(
+								client.batch_execute(take),
+								futures_util::future::join_all(share.iter().map(|(claims, _)| async move {
+									client.query_one(statement, &[claims, keys]).await
+								})),
+								client.batch_execute("reset role"),
+							)
+							.await,
+						)
 					}
+				},
+			))
+			.await;
+			for (n, (share, run)) in shares.iter().zip(runs).enumerate() {
+				let Some((taken, answers, given_back)) = run else {
+					continue;
 				};
-				// A position counts among the keys; `eligible` says which change each belongs to.
-				let found: std::collections::HashSet<i32> = positions
-					.iter()
-					.filter_map(|p| eligible.get((*p as usize).wrapping_sub(1)).copied())
-					.collect();
-				for id in ids {
-					let these = match passed.get(id) {
-						Some((_, filtered)) => found.intersection(filtered).copied().collect(),
-						None => found.clone(),
+				given_back?;
+				if let Err(e) = taken {
+					// The checks ran as the server itself, which no policy restrains: none counts.
+					tracing::warn!(role = %role, error = %e, "a subscriber's role cannot be taken");
+					continue;
+				}
+				for ((_, ids), answer) in share.iter().zip(answers) {
+					let positions: Vec<i32> = match answer {
+						Ok(row) => row.get::<_, Option<Vec<i32>>>(0).unwrap_or_default(),
+						Err(e) => {
+							// Prepared again next time, in case the table changed under it.
+							statements[n].remove(&wrapped);
+							tracing::warn!(
+								subscriptions = ids.len(),
+								error = %e,
+								"the row-level security check of a subscriber raised"
+							);
+							continue;
+						}
 					};
-					sees.insert(id.clone(), Sees::These(these));
+					// A position counts among the keys; `eligible` says which change each belongs to.
+					let found: std::collections::HashSet<i32> = positions
+						.iter()
+						.filter_map(|p| eligible.get((*p as usize).wrapping_sub(1)).copied())
+						.collect();
+					for id in ids {
+						let these = match passed.get(id) {
+							Some((_, filtered)) => found.intersection(filtered).copied().collect(),
+							None => found.clone(),
+						};
+						sees.insert(id.clone(), Sees::These(these));
+					}
 				}
 			}
 		}
