@@ -5,8 +5,8 @@ Realtime for Postgres-backed apps over WebSockets: **broadcast** between clients
 **row-level security deciding who sees what**. One static binary, written in Rust, built to run
 every project on a SnoutData Cloud host.
 
-> **Status: in development.** The server speaks the whole protocol, creates its own schema, and
-> streams database changes through its own pipeline; it is not yet running on SnoutData Cloud.
+> **Status: in production.** Every SnoutData Cloud project's Realtime runs on it since
+> 2026-09-28 (image 0.1.0).
 
 - **Your policies decide.** A private channel is authorised by the policies on
   `realtime.messages`, and a database change reaches a subscriber only if a `select` of that row,
