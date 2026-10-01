@@ -16,7 +16,7 @@ FROM scratch
 COPY --from=build /snout-realtime /snout-realtime
 USER 1000:1000
 EXPOSE 4000
-# How SnoutData Desktop's "Find databases" knows this container is part of the SnoutData stack
+# How SnoutData Studio's "Find databases" knows this container is part of the SnoutData stack
 # (docs/desktop/DISCOVERY.md): by label, never by guessing from the image name. Only the
 # `postgres` component is offered as a database; the rest are recognised and left out.
 LABEL com.snoutdata.stack="1" com.snoutdata.component="realtime"
