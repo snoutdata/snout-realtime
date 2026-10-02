@@ -196,8 +196,10 @@ impl Connection {
 					)
 					.map_err(|e| protocol(&e.to_string()))?;
 					self.flush().await?;
-					let Message::AuthenticationSaslContinue(body) = self.message().await? else {
-						return Err(protocol("expected SASL continue"));
+					let body = match self.message().await? {
+						Message::AuthenticationSaslContinue(body) => body,
+						Message::ErrorResponse(body) => return Err(server_error(body.fields())),
+						_ => return Err(protocol("expected SASL continue")),
 					};
 					state
 						.update(body.data())
@@ -205,8 +207,12 @@ impl Connection {
 					frontend::sasl_response(state.message(), &mut self.write)
 						.map_err(|e| protocol(&e.to_string()))?;
 					self.flush().await?;
-					let Message::AuthenticationSaslFinal(body) = self.message().await? else {
-						return Err(protocol("expected SASL final"));
+					// A wrong password is an ErrorResponse here, and it used to be reported as
+					// "expected SASL final", which named the protocol rather than the problem.
+					let body = match self.message().await? {
+						Message::AuthenticationSaslFinal(body) => body,
+						Message::ErrorResponse(body) => return Err(server_error(body.fields())),
+						_ => return Err(protocol("expected SASL final")),
 					};
 					state
 						.finish(body.data())

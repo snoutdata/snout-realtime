@@ -182,7 +182,24 @@ async fn put_tenant(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes
 	match app.registry.put(tenant).await {
 		Ok(t) => {
 			if let Some(rt) = app.hub.get(&t.external_id) {
+				// A rotated JWT secret is a new derived database password, so the streams this
+				// process holds were opened, or will retry, with one the database no longer
+				// takes. Reset them the way a delete does, keeping the tenant: sockets close
+				// (their tokens died with the old secret anyway) and the client reconnects.
+				let moved = rt.tenant().database != t.database;
 				rt.set_tenant(t.clone());
+				if moved {
+					rt.disconnect_all();
+					let mut streams = rt.streams.lock().await;
+					if let Some(task) = streams.messages.take() {
+						task.abort();
+					}
+					if let Some(changes) = streams.changes.take() {
+						changes.retire();
+					}
+					drop(streams);
+					app.dbs.forget(&t.external_id).await;
+				}
 			}
 			json_response(StatusCode::CREATED, json!({ "data": t.public_json() }))
 		}

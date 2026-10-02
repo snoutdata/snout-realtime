@@ -61,6 +61,10 @@ pub struct Changes {
 	/// The poller's slot is ready (made on its own connection).
 	ready: Notify,
 	running: std::sync::atomic::AtomicBool,
+	/// Replaced, because the tenant's database settings changed (a rotated JWT secret is a new
+	/// derived password): the stream stops, and the next join makes a new one. Without it the
+	/// retry loop below spun forever on the old password while any listener was left.
+	retired: std::sync::atomic::AtomicBool,
 }
 
 /// The id a binding is known by. A stable hash of its parameters, so the same binding gets the
@@ -261,7 +265,18 @@ impl Changes {
 			wake: Notify::new(),
 			ready: Notify::new(),
 			running: false.into(),
+			retired: false.into(),
 		})
+	}
+
+	/// The settings this stream connects with, to tell whether the tenant's have moved on.
+	pub fn database(&self) -> &Database {
+		&self.database
+	}
+
+	/// Stop this stream for good; see `retired`.
+	pub fn retire(&self) {
+		self.retired.store(true, Ordering::SeqCst);
 	}
 
 	/// Insert a channel's bindings, all or none. The error is the sentence the client gets.
@@ -436,7 +451,8 @@ impl Changes {
 				Err(e) => {
 					tracing::warn!(tenant = %rt.id, error = %e, "database changes");
 					tokio::time::sleep(Duration::from_millis(500)).await;
-					if self.listeners.lock().await.is_empty() {
+					if self.retired.load(Ordering::SeqCst) || self.listeners.lock().await.is_empty()
+					{
 						break;
 					}
 				}
@@ -523,6 +539,9 @@ impl Changes {
 				match tokio::time::timeout(Duration::from_secs(5), conn.next()).await {
 					Ok(e) => e.map_err(|e| e.to_string())?,
 					Err(_) => {
+						if self.retired.load(Ordering::SeqCst) {
+							return Ok(());
+						}
 						if self.listeners.lock().await.is_empty() {
 							let since = *idle_since.get_or_insert_with(std::time::Instant::now);
 							if since.elapsed() > Duration::from_secs(30) {

@@ -568,6 +568,14 @@ impl Socket {
 			let pool = self.pool().await?;
 			let changes = {
 				let mut streams = self.rt.streams.lock().await;
+				// A stream made for other settings (a re-registration that moved the password or
+				// the database) can never connect again; a fresh one uses the tenant's own.
+				if let Some(old) = &streams.changes
+					&& old.database() != &database
+				{
+					old.retire();
+					streams.changes = None;
+				}
 				streams
 					.changes
 					.get_or_insert_with(|| changes::Changes::new(database))
