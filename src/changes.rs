@@ -422,15 +422,7 @@ impl Changes {
 			listeners.remove(id);
 		}
 		drop(listeners);
-		if let Ok(client) = pool.get().await {
-			let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
-			let _ = client
-				.execute(
-					"delete from realtime.subscription where subscription_id = any($1::text[]::uuid[])",
-					&[&ids],
-				)
-				.await;
-		}
+		forget_rows(pool, ids).await;
 	}
 
 	async fn ensure_stream(self: &Arc<Self>, rt: Arc<TenantRt>) {
@@ -759,6 +751,26 @@ impl Changes {
 				data: data.clone(),
 			});
 		}
+	}
+}
+
+/// Delete a channel's subscription rows. Separate from `Changes::unsubscribe` because a channel
+/// can outlive its stream: a re-registration that moves the database password retires the stream
+/// and then closes the sockets, and the rows of every channel it closed were left behind until the
+/// next subscriber's sweep (QA round 7: a key rotation, and the dashboard counting a subscriber
+/// that had gone).
+pub async fn forget_rows(pool: &deadpool_postgres::Pool, ids: &[Uuid]) {
+	if ids.is_empty() {
+		return;
+	}
+	if let Ok(client) = pool.get().await {
+		let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+		let _ = client
+			.execute(
+				"delete from realtime.subscription where subscription_id = any($1::text[]::uuid[])",
+				&[&ids],
+			)
+			.await;
 	}
 }
 

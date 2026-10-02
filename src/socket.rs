@@ -619,11 +619,15 @@ impl Socket {
 		self.rt.left(self.id);
 		if !ch.bindings.is_empty() {
 			let changes = self.rt.streams.lock().await.changes.clone();
-			if let (Some(changes), Some(database)) = (changes, self.rt.tenant().database.clone())
+			if let Some(database) = self.rt.tenant().database.clone()
 				&& let Ok(pool) = self.app.dbs.pool(&self.rt.id, &database).await
 			{
 				let ids: Vec<Uuid> = ch.bindings.iter().map(|b| b.subscription_id).collect();
-				changes.unsubscribe(&pool, &ids).await;
+				match changes {
+					Some(changes) => changes.unsubscribe(&pool, &ids).await,
+					// The stream was retired under this channel (`changes::forget_rows`).
+					None => crate::changes::forget_rows(&pool, &ids).await,
+				}
 			}
 		}
 	}
