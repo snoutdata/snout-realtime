@@ -644,7 +644,9 @@ impl Changes {
 					checkers.push(c);
 					statements.push(Statements::new());
 				}
-				Err(e) => tracing::warn!(tenant = %rt.id, error = %e, "a second connection for the checks"),
+				Err(e) => {
+					tracing::warn!(tenant = %rt.id, error = %e, "a second connection for the checks")
+				}
 			}
 		}
 		let started = std::time::Instant::now();
@@ -970,7 +972,10 @@ pub async fn decide(
 		} else {
 			format!(
 				"select snout_realtime.await_visible('{{{}}}'); ",
-				xids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+				xids.iter()
+					.map(u32::to_string)
+					.collect::<Vec<_>>()
+					.join(",")
 			)
 		};
 		let wrapped = format!(
@@ -979,7 +984,9 @@ pub async fn decide(
 		for (role, claim_groups) in &checks {
 			// A role's claims, split across the connections there are, in order: each takes its
 			// share of the checks at once, as the database has a process per connection.
-			let share = claim_groups.len().div_ceil(clients.len().min(claim_groups.len()).max(1));
+			let share = claim_groups
+				.len()
+				.div_ceil(clients.len().min(claim_groups.len()).max(1));
 			let shares: Vec<&[(String, Vec<String>)]> = claim_groups.chunks(share.max(1)).collect();
 			let mut prepared = Vec::with_capacity(shares.len());
 			for (n, _) in shares.iter().enumerate() {
@@ -1005,25 +1012,28 @@ pub async fn decide(
 				"{visible}set role {}; select set_config('request.jwt.claims', '{{}}', false)",
 				quote_ident(role)
 			);
-			let runs = futures_util::future::join_all(shares.iter().zip(&prepared).enumerate().map(
-				|(n, (share, statement))| {
-					let (client, take) = (clients[n], &take);
-					async move {
-						let statement = statement.as_ref()?;
-						Some(
-							futures_util::future::join3(
-								client.batch_execute(take),
-								futures_util::future::join_all(share.iter().map(|(claims, _)| async move {
-									client.query_one(statement, &[claims, keys]).await
-								})),
-								client.batch_execute("reset role"),
+			let runs =
+				futures_util::future::join_all(shares.iter().zip(&prepared).enumerate().map(
+					|(n, (share, statement))| {
+						let (client, take) = (clients[n], &take);
+						async move {
+							let statement = statement.as_ref()?;
+							Some(
+								futures_util::future::join3(
+									client.batch_execute(take),
+									futures_util::future::join_all(share.iter().map(
+										|(claims, _)| async move {
+											client.query_one(statement, &[claims, keys]).await
+										},
+									)),
+									client.batch_execute("reset role"),
+								)
+								.await,
 							)
-							.await,
-						)
-					}
-				},
-			))
-			.await;
+						}
+					},
+				))
+				.await;
 			for (n, (share, run)) in shares.iter().zip(runs).enumerate() {
 				let Some((taken, answers, given_back)) = run else {
 					continue;

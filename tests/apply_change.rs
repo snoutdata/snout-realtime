@@ -126,7 +126,10 @@ async fn batch(
 		.get(0);
 	// A transaction that has committed, as a change carries its own, so the checks wait for it.
 	let xid: i64 = db
-		.query_one("select pg_current_xact_id()::text::bigint % 4294967296", &[])
+		.query_one(
+			"select pg_current_xact_id()::text::bigint % 4294967296",
+			&[],
+		)
 		.await
 		.unwrap()
 		.get(0);
@@ -141,10 +144,16 @@ async fn batch(
 		.collect();
 	let mut statements = STATEMENTS.with(|s| std::mem::take(&mut *s.borrow_mut()));
 	let second = SECOND.with(|s| s.borrow_mut().take()).unwrap();
-	let groups =
-		snout_realtime::changes::decide(&[db, &second], &mut statements, oid, action, &changes, 1_048_576)
-			.await
-			.unwrap();
+	let groups = snout_realtime::changes::decide(
+		&[db, &second],
+		&mut statements,
+		oid,
+		action,
+		&changes,
+		1_048_576,
+	)
+	.await
+	.unwrap();
 	SECOND.with(|s| *s.borrow_mut() = Some(second));
 	STATEMENTS.with(|s| *s.borrow_mut() = statements);
 	let mut out: Vec<_> = groups
