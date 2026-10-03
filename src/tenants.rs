@@ -48,6 +48,11 @@ pub struct TenantBody {
 	pub presence_enabled: Option<bool>,
 	#[serde(default)]
 	pub extensions: Vec<Extension>,
+	/// What a client is told when it asks for postgres_changes on a tenant registered without
+	/// them, in place of the generic sentence: a hosted platform says why (its plan), which this
+	/// server cannot know.
+	#[serde(default)]
+	pub postgres_changes_refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,6 +94,21 @@ pub struct Tenant {
 	/// `None` when the tenant was registered without `postgres_cdc_rls`: it may not serve
 	/// postgres_changes at all, whatever a client asks (`RealtimeTenant.postgresChanges`).
 	pub database: Option<Database>,
+	/// The sentence a postgres_changes request is refused with when `database` is `None`; the
+	/// generic one (`NO_CHANGES`) when this is `None` too.
+	pub postgres_changes_refusal: Option<String>,
+}
+
+/// What a client asking for postgres_changes is told when the tenant has none and was given no
+/// sentence of its own.
+pub const NO_CHANGES: &str = "postgres_changes is not enabled for this project";
+
+/// A refusal is a sentence for a person, not a payload: blank is none, and it is cut to this.
+const MAX_REFUSAL_CHARS: usize = 300;
+
+fn refusal_of(text: Option<&str>) -> Option<String> {
+	let text = text?.trim();
+	(!text.is_empty()).then(|| text.chars().take(MAX_REFUSAL_CHARS).collect())
 }
 
 impl Tenant {
@@ -246,6 +266,7 @@ pub fn from_body(body: &TenantBody) -> Result<Tenant, TenantError> {
 		private_only: body.private_only.unwrap_or(false),
 		presence_enabled: body.presence_enabled.unwrap_or(false),
 		database,
+		postgres_changes_refusal: refusal_of(body.postgres_changes_refusal.as_deref()),
 	})
 }
 
@@ -294,6 +315,7 @@ impl Registry {
 			"max_payload_size_in_kb": t.max_payload_size_in_kb,
 			"private_only": t.private_only,
 			"presence_enabled": t.presence_enabled,
+			"postgres_changes_refusal": t.postgres_changes_refusal,
 		})
 	}
 
@@ -352,6 +374,9 @@ impl Registry {
 				.get("presence_enabled")
 				.and_then(Value::as_bool)
 				.unwrap_or(false),
+			postgres_changes_refusal: refusal_of(
+				as_string(settings, "postgres_changes_refusal").as_deref(),
+			),
 			external_id,
 			database,
 		})
@@ -486,5 +511,31 @@ mod tests {
 		)
 		.unwrap();
 		assert!(from_body(&body).unwrap().database.is_none());
+	}
+
+	#[test]
+	fn a_tenant_without_changes_can_say_why_and_keeps_saying_it_when_read_back() {
+		let body: TenantBody = serde_json::from_value(json!({
+			"external_id": "x", "jwt_secret": "s", "extensions": [],
+			"postgres_changes_refusal": "  Table changes are on the paid plans.  "
+		}))
+		.unwrap();
+		let t = from_body(&body).unwrap();
+		assert_eq!(
+			t.postgres_changes_refusal.as_deref(),
+			Some("Table changes are on the paid plans.")
+		);
+		let registry = Registry::new("postgres://unused", "a key");
+		let sealed = registry.sealer.seal("s");
+		let back = registry
+			.tenant_of_row("x".into(), &sealed, &Registry::settings_json(&t), None)
+			.unwrap();
+		assert_eq!(back.postgres_changes_refusal, t.postgres_changes_refusal);
+		// Blank is none, so the generic sentence is used.
+		let blank: TenantBody = serde_json::from_value(
+			json!({"external_id": "x", "jwt_secret": "s", "postgres_changes_refusal": " "}),
+		)
+		.unwrap();
+		assert_eq!(from_body(&blank).unwrap().postgres_changes_refusal, None);
 	}
 }

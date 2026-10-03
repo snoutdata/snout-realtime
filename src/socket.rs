@@ -561,10 +561,12 @@ impl Socket {
 	) {
 		let tenant = self.rt.tenant();
 		let outcome = async {
-			let database = tenant
-				.database
-				.clone()
-				.ok_or("postgres_changes is not enabled for this project".to_string())?;
+			let database = tenant.database.clone().ok_or_else(|| {
+				tenant
+					.postgres_changes_refusal
+					.clone()
+					.unwrap_or_else(|| crate::tenants::NO_CHANGES.to_string())
+			})?;
 			let pool = self.pool().await?;
 			let changes = {
 				let mut streams = self.rt.streams.lock().await;
