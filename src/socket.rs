@@ -862,6 +862,15 @@ impl Socket {
 			}
 			return;
 		}
+		// The tenant's messages a second, counted on the same window the HTTP endpoint uses.
+		// It was counted there only, so one socket could broadcast without limit through a
+		// server every project on the host shares (QA round 11: 1,500 in a burst, all delivered
+		// on a 500 a second plan). Over it, the channel is closed as the pinned server closes it.
+		if self.rt.events.add(1, tenant.max_events_per_second) {
+			let topic = m.topic.clone();
+			self.shutdown(&topic, "Too many messages per second").await;
+			return;
+		}
 		match &m.payload {
 			InboundPayload::UserBroadcast {
 				user_event,
