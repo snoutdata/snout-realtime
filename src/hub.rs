@@ -7,12 +7,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::inspect;
 use crate::presence::{self, Diff, SubscriberId};
 use crate::protocol::Encoding;
 use crate::tenants::Tenant;
@@ -70,12 +71,17 @@ pub struct Sub {
 	pub tx: UnboundedSender<Out>,
 	/// Message ids replayed at join, not to be delivered again live.
 	pub replayed: Arc<HashSet<String>>,
+	/// The presence key this channel tracks under (the client's, or one made for it).
+	pub presence_key: Arc<str>,
+	/// When it joined, in milliseconds since the epoch.
+	pub joined_at: i64,
 }
 
 #[derive(Default)]
 struct TopicRt {
 	subs: Vec<Sub>,
 	presence: presence::Topic,
+	stats: inspect::Window,
 }
 
 /// Events per second over a sliding one-second window.
@@ -107,8 +113,8 @@ pub struct Counters {
 	pub output_bytes: AtomicU64,
 }
 
-/// An open socket: the client's address, and its queue.
-type SocketEntry = (Option<String>, UnboundedSender<Out>);
+/// An open socket: the client's address, its queue, and when a frame last arrived from it.
+type SocketEntry = (Option<String>, UnboundedSender<Out>, Arc<AtomicI64>);
 
 /// A user broadcast to deliver: its event, its payload as it arrived, and the metadata a stored
 /// message carries (`{ id }`), whose id also keeps a replayed message from arriving twice.
@@ -135,6 +141,8 @@ pub struct TenantRt {
 	pub events: Rate,
 	pub presence: Rate,
 	pub counters: Counters,
+	/// Connections coming and going, for the project's owner (`inspect.rs`).
+	pub log: inspect::EventLog,
 	/// Set up once per process: the realtime schema and the message partitions.
 	pub prepared: tokio::sync::Mutex<bool>,
 	/// The database streams, started on first need.
@@ -255,6 +263,7 @@ impl TenantRt {
 		}
 		let payload = Arc::new(diff.payload());
 		let subs = self.subscribers(key, except);
+		self.record(key, |w| w.presence(subs.len()));
 		self.counters
 			.presence_events
 			.fetch_add(subs.len() as u64, Ordering::Relaxed);
@@ -292,11 +301,87 @@ impl TenantRt {
 		}
 	}
 
-	pub fn socket_opened(&self, socket: u64, address: Option<String>, tx: UnboundedSender<Out>) {
+	/// A socket opened; returns the clock its frames from the client are stamped on.
+	pub fn socket_opened(
+		&self,
+		socket: u64,
+		address: Option<String>,
+		tx: UnboundedSender<Out>,
+	) -> Arc<AtomicI64> {
+		let seen = Arc::new(AtomicI64::new(inspect::now_ms()));
 		self.sockets
 			.lock()
 			.unwrap_or_else(|e| e.into_inner())
-			.insert(socket, (address, tx));
+			.insert(socket, (address, tx, seen.clone()));
+		seen
+	}
+
+	/// Count something on a topic's message window, if the topic is open.
+	fn record(&self, key: &TopicKey, f: impl FnOnce(&mut inspect::Window)) {
+		if let Some(t) = self.topics().get_mut(key) {
+			f(&mut t.stats);
+		}
+	}
+
+	/// What is open now: every channel (or the one named), who is on it, its presence and its
+	/// last minute of messages. A client is named by its socket and presence key; the address
+	/// it came from is not shown, because that is somebody's IP address.
+	pub fn inspect(&self, channel: Option<&str>) -> Value {
+		let now = inspect::now_ms();
+		let seen: HashMap<u64, i64> = self
+			.sockets
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.iter()
+			.map(|(id, (_, _, at))| (*id, at.load(Ordering::Relaxed)))
+			.collect();
+		let users = self.census.lock().unwrap_or_else(|e| e.into_inner()).len();
+		let topics = self.topics();
+		let mut keys: Vec<&TopicKey> = topics
+			.keys()
+			.filter(|k| channel.is_none_or(|c| k.name == c))
+			.collect();
+		keys.sort_by(|a, b| (&a.name, a.private).cmp(&(&b.name, b.private)));
+		let channels: Vec<Value> = keys
+			.into_iter()
+			.map(|k| {
+				let t = &topics[k];
+				let clients: Vec<Value> = t
+					.subs
+					.iter()
+					.map(|s| {
+						let last = seen.get(&s.socket).copied();
+						serde_json::json!({
+							"socket": s.socket,
+							"presence_key": &*s.presence_key,
+							"joined_at": s.joined_at,
+							"last_seen_ms_ago": last.map(|at| (now - at).max(0)),
+						})
+					})
+					.collect();
+				serde_json::json!({
+					"name": k.name,
+					"private": k.private,
+					"clients": clients,
+					"presence": t.presence.state(),
+					"messages": t.stats.summary(),
+				})
+			})
+			.collect();
+		drop(topics);
+		let tenant = self.tenant();
+		serde_json::json!({
+			"at": now,
+			"connections": seen.len(),
+			"connected_users": users,
+			"limits": {
+				"max_events_per_second": tenant.max_events_per_second,
+				"max_concurrent_users": tenant.max_concurrent_users,
+				"max_channels_per_client": tenant.max_channels_per_client,
+				"max_joins_per_second": tenant.max_joins_per_second,
+			},
+			"channels": channels,
+		})
 	}
 
 	pub fn socket_closed(&self, socket: u64) {
@@ -316,7 +401,7 @@ impl TenantRt {
 		(
 			s.len(),
 			s.values()
-				.filter(|(a, _)| a.as_deref() == Some(address))
+				.filter(|(a, _, _)| a.as_deref() == Some(address))
 				.count(),
 		)
 	}
@@ -327,7 +412,7 @@ impl TenantRt {
 
 	/// Close every socket (the tenant was deleted).
 	pub fn disconnect_all(&self) {
-		for (_, tx) in self
+		for (_, tx, _) in self
 			.sockets
 			.lock()
 			.unwrap_or_else(|e| e.into_inner())
@@ -367,6 +452,7 @@ impl Hub {
 			events: Rate::default(),
 			presence: Rate::default(),
 			counters: Counters::default(),
+			log: inspect::EventLog::default(),
 			prepared: tokio::sync::Mutex::new(false),
 			streams: tokio::sync::Mutex::new(Streams::default()),
 		});
@@ -431,6 +517,7 @@ pub fn deliver_user(
 		});
 	}
 	rt.counters.events.fetch_add(n as u64, Ordering::Relaxed);
+	rt.record(key, |w| w.broadcast(n));
 	n
 }
 
@@ -452,5 +539,6 @@ pub fn deliver_json(
 		});
 	}
 	rt.counters.events.fetch_add(n as u64, Ordering::Relaxed);
+	rt.record(key, |w| w.broadcast(n));
 	n
 }

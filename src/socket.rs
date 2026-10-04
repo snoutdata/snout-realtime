@@ -19,6 +19,7 @@ use crate::App;
 use crate::changes::{self, Binding};
 use crate::db::{self, AuthContext, Policies};
 use crate::hub::{self, Out, Sub, TenantRt, TopicKey};
+use crate::inspect::{self, Event, Kind};
 use crate::jwt;
 use crate::protocol::{self, Frame, Inbound, InboundPayload, Vsn};
 
@@ -82,9 +83,12 @@ struct Socket {
 pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 	let (tx, mut rx) = unbounded_channel();
 	let id = app.hub.next_id();
-	accepted
+	let seen = accepted
 		.rt
 		.socket_opened(id, accepted.address.clone(), tx.clone());
+	accepted.rt.log.push(Event::new(Kind::Connect).socket(id));
+	// How the socket ended, for the project's log. Set where the loop is left.
+	let mut ended = "connection lost (no close frame)".to_string();
 	let mut s = Socket {
 		app,
 		rt: accepted.rt,
@@ -107,6 +111,9 @@ pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 		};
 		tokio::select! {
 			incoming = stream.next() => {
+				if matches!(incoming, Some(Ok(_))) {
+					seen.store(inspect::now_ms(), Ordering::Relaxed);
+				}
 				match incoming {
 					Some(Ok(WsMessage::Text(text))) => {
 						match protocol::decode_text(s.vsn, text.as_str()) {
@@ -120,24 +127,44 @@ pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 							Err(e) => tracing::debug!(error = %e, "an undecodable frame"),
 						}
 					}
-					Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => break,
+					Some(Ok(WsMessage::Close(frame))) => {
+						ended = match frame {
+							Some(f) if !f.reason.is_empty() => {
+								format!("client closed ({}: {})", f.code, f.reason.as_str())
+							}
+							Some(f) => format!("client closed ({})", f.code),
+							None => "client closed".to_string(),
+						};
+						break;
+					}
+					None => break,
+					Some(Err(e)) => {
+						ended = format!("connection error: {e}");
+						break;
+					}
 					Some(Ok(_)) => {}
 				}
 			}
 			out = rx.recv() => {
 				match out {
-					Some(Out::Disconnect) | None => break,
+					Some(Out::Disconnect) | None => {
+						ended = "closed by the server (the project's Realtime settings were reset)".to_string();
+						break;
+					}
 					Some(o) => s.deliver(o).await,
 				}
 			}
 			_ = wait => s.confirm_tokens().await,
 		}
 		if !s.flush(&mut sink).await {
+			ended = "the client could not be written to".to_string();
 			break;
 		}
 	}
 	s.close_all().await;
 	s.rt.socket_closed(s.id);
+	s.rt.log
+		.push(Event::new(Kind::Disconnect).socket(s.id).reason(ended));
 	let _ = sink.close().await;
 	drain(&mut rx);
 }
@@ -217,6 +244,12 @@ impl Socket {
 			"phx_join" => self.join(m).await,
 			"phx_leave" => {
 				if let Some(ch) = self.channels.remove(&m.topic) {
+					self.rt.log.push(
+						Event::new(Kind::Leave)
+							.socket(self.id)
+							.channel(&ch.name)
+							.presence_key(&ch.presence_key),
+					);
 					self.cleanup(ch).await;
 					self.reply(&m, "ok", json!({}));
 					let join_ref = m.join_ref.clone();
@@ -246,6 +279,12 @@ impl Socket {
 		}
 		match self.try_join(&m).await {
 			Ok((channel, response, after)) => {
+				self.rt.log.push(
+					Event::new(Kind::Join)
+						.socket(self.id)
+						.channel(&channel.name)
+						.presence_key(&channel.presence_key),
+				);
 				self.reply(&m, "ok", response);
 				let name = channel.name.clone();
 				let join_ref = channel.join_ref.clone();
@@ -277,7 +316,16 @@ impl Socket {
 						.await;
 				}
 			}
-			Err(reason) => self.reply(&m, "error", json!({ "reason": reason })),
+			Err(reason) => {
+				let mut event = Event::new(Kind::JoinRefused)
+					.socket(self.id)
+					.reason(reason.clone());
+				if let Some(name) = m.topic.strip_prefix("realtime:") {
+					event = event.channel(name);
+				}
+				self.rt.log.push(event);
+				self.reply(&m, "error", json!({ "reason": reason }));
+			}
 		}
 	}
 
@@ -476,6 +524,8 @@ impl Socket {
 				join_topic: m.topic.clone(),
 				tx: self.tx.clone(),
 				replayed: Arc::new(replayed),
+				presence_key: Arc::from(presence_key.as_str()),
+				joined_at: inspect::now_ms(),
 			},
 		);
 		let exp = claims.get("exp").and_then(Value::as_i64).unwrap_or(0);
@@ -645,6 +695,13 @@ impl Socket {
 	async fn shutdown(&mut self, topic: &str, message: &str) {
 		if let Some(ch) = self.channels.remove(topic) {
 			let (join_ref, name) = (ch.join_ref.clone(), ch.name.clone());
+			self.rt.log.push(
+				Event::new(Kind::ChannelClosed)
+					.socket(self.id)
+					.channel(&name)
+					.presence_key(&ch.presence_key)
+					.reason(message),
+			);
 			self.cleanup(ch).await;
 			self.system(topic, &join_ref, "system", "error", message, &name);
 			self.close_frame(topic, &join_ref);

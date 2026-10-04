@@ -79,6 +79,18 @@ bytes with `application/octet-stream`; `?private=true` for a private channel). E
 project's key or a user's token, and a private message is sent only if the caller's policy on
 `realtime.messages` allows the insert.
 
+## Inspection
+
+`GET /socket/inspect` (`?channel=`) is what a project has open now: each channel, its clients
+(socket number, presence key, when it joined, how long since a frame last arrived from it), its
+presence state, and its last minute of broadcasts in, deliveries out and the busiest second.
+`GET /socket/events` (`?since=<epoch ms>&channel=`) is a log of the newest thousand connects,
+refused connects, joins, refused joins, leaves, channels the server closed and disconnects, each
+with its reason (the client's close code and reason, a lost connection, a rate limit). Both are
+per project from the `Host`, in memory, and answer only the project's `service_role` token: they
+are every user's presence, which the anon key in a web page must not read. Under `/socket` so a
+gateway that maps `/realtime/v1` to `/socket` reaches them with no route of its own.
+
 ## Operating it
 
 - **Health.** `GET /` answers `ok` once the server listens. `GET /api/tenants/{id}/health` (tenant

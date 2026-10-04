@@ -10,6 +10,7 @@ pub mod changes;
 pub mod config;
 pub mod db;
 pub mod hub;
+pub mod inspect;
 pub mod jwt;
 pub mod messages;
 pub mod pgoutput;

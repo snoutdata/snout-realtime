@@ -17,6 +17,7 @@ use serde_json::{Map, Value, json};
 use crate::App;
 use crate::db::{self, AuthContext, Policies};
 use crate::hub::{self, TopicKey};
+use crate::inspect::{Event, Kind};
 use crate::jwt;
 use crate::protocol::{Encoding, Vsn};
 use crate::socket::{self, Accepted, now_secs};
@@ -30,6 +31,11 @@ pub fn router(app: Arc<App>) -> Router {
 			get(|| async { axum::Json(json!({ "message": "Success" })) }),
 		)
 		.route("/socket/websocket", get(websocket))
+		// Under `/socket` so the front door's `/realtime/v1` prefix reaches them as it reaches the
+		// socket: `/realtime/v1/inspect` and `/realtime/v1/events`. The project's service_role
+		// key only (`owner`).
+		.route("/socket/inspect", get(inspect))
+		.route("/socket/events", get(events))
 		.route("/api/tenants", get(list_tenants).post(put_tenant))
 		.route("/api/tenants/{id}", get(show_tenant).delete(delete_tenant))
 		.route("/api/tenants/{id}/health", get(tenant_health))
@@ -103,9 +109,17 @@ async fn websocket(
 		.map(str::to_string)
 		.or_else(|| params.get("apikey").cloned());
 	let Some(token) = token else {
+		if let Some(rt) = app.hub.get(&id) {
+			rt.log
+				.push(Event::new(Kind::ConnectRefused).reason("no API key"));
+		}
 		return forbidden();
 	};
-	if jwt::authorize(&token, &tenant.jwt_secret, now_secs()).is_err() {
+	if let Err(e) = jwt::authorize(&token, &tenant.jwt_secret, now_secs()) {
+		app.hub
+			.tenant(tenant)
+			.log
+			.push(Event::new(Kind::ConnectRefused).reason(e.message()));
 		return forbidden();
 	}
 	let rt = app.hub.tenant(tenant);
@@ -119,6 +133,9 @@ async fn websocket(
 		&& cap > 0
 		&& rt.sockets_from(addr).1 >= cap
 	{
+		rt.log.push(
+			Event::new(Kind::ConnectRefused).reason("Too many connections from this address"),
+		);
 		return (
 			StatusCode::TOO_MANY_REQUESTS,
 			"Too many connections from this address",
@@ -148,6 +165,69 @@ async fn websocket(
 		.read_buffer_size(4096)
 		.write_buffer_size(4096)
 		.on_upgrade(move |ws| socket::serve(app, ws, accepted))
+}
+
+// --- inspection (inspect.rs) --------------------------------------------------------------
+
+/// The project from the host, and the caller only if it holds the project's `service_role`
+/// key: what is inspected here is every player's presence and the log of who left and why,
+/// which is the owner's to read and never a stranger's holding the anon key from a web page.
+async fn owner(app: &App, headers: &HeaderMap) -> Result<Arc<tenants::Tenant>, Box<Response>> {
+	let (tenant, claims) = http_caller(app, headers).await?;
+	if claims.get("role").and_then(Value::as_str) != Some("service_role") {
+		return Err(Box::new(json_response(
+			StatusCode::FORBIDDEN,
+			json!({ "message": "Inspecting Realtime needs the project's service_role key" }),
+		)));
+	}
+	Ok(tenant)
+}
+
+/// The channels open now: `?channel=` narrows to one.
+async fn inspect(
+	State(app): State<Arc<App>>,
+	headers: HeaderMap,
+	Query(params): Query<HashMap<String, String>>,
+) -> Response {
+	let tenant = match owner(&app, &headers).await {
+		Ok(t) => t,
+		Err(r) => return *r,
+	};
+	let rt = app.hub.tenant(tenant);
+	let channel = params
+		.get("channel")
+		.map(String::as_str)
+		.filter(|c| !c.is_empty());
+	json_response(StatusCode::OK, rt.inspect(channel))
+}
+
+/// The connection log: `?since=` (milliseconds since the epoch) and `?channel=` narrow it.
+async fn events(
+	State(app): State<Arc<App>>,
+	headers: HeaderMap,
+	Query(params): Query<HashMap<String, String>>,
+) -> Response {
+	let tenant = match owner(&app, &headers).await {
+		Ok(t) => t,
+		Err(r) => return *r,
+	};
+	let rt = app.hub.tenant(tenant);
+	let since = params
+		.get("since")
+		.and_then(|s| s.parse::<i64>().ok())
+		.unwrap_or(0);
+	let channel = params
+		.get("channel")
+		.map(String::as_str)
+		.filter(|c| !c.is_empty());
+	json_response(
+		StatusCode::OK,
+		json!({
+			"at": crate::inspect::now_ms(),
+			"capacity": crate::inspect::LOG_CAPACITY,
+			"events": rt.log.since(since, channel),
+		}),
+	)
 }
 
 // --- the tenant API -----------------------------------------------------------------------
