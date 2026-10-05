@@ -18,12 +18,11 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 use crate::db::quote_ident;
-use crate::hub::{Out, TenantRt};
+use crate::hub::{Out, Outbox, TenantRt};
 use crate::pgoutput::{self, Message, Old, Relation};
 use crate::replication::{Connection, Event, Target};
 use crate::tenants::Database;
@@ -45,7 +44,7 @@ pub struct Binding {
 struct Listener {
 	/// The channel join this binding came with: all of a channel's bindings share it.
 	channel: u64,
-	tx: UnboundedSender<Out>,
+	tx: Outbox,
 	join_topic: String,
 	id: i64,
 	schema: String,
@@ -286,7 +285,7 @@ impl Changes {
 		pool: &deadpool_postgres::Pool,
 		claims: &Map<String, Value>,
 		bindings: &[Binding],
-		tx: UnboundedSender<Out>,
+		tx: Outbox,
 		join_topic: &str,
 	) -> Result<(), String> {
 		self.ensure_stream(rt).await;
@@ -725,7 +724,7 @@ impl Changes {
 	async fn dispatch(&self, rt: &TenantRt, ids: &[String], data: String) {
 		let listeners = self.listeners.lock().await;
 		// One frame per channel, with every one of its bindings the change matched.
-		let mut per_channel: HashMap<u64, (UnboundedSender<Out>, String, Vec<i64>)> =
+		let mut per_channel: HashMap<u64, (Outbox, String, Vec<i64>)> =
 			HashMap::with_capacity(ids.len());
 		for id in ids {
 			let Ok(uuid) = Uuid::parse_str(id) else {
@@ -747,7 +746,7 @@ impl Changes {
 			.db_events
 			.fetch_add(per_channel.len() as u64, Ordering::Relaxed);
 		for (tx, join_topic, ids) in per_channel.into_values() {
-			let _ = tx.send(Out::Changes {
+			tx.send(Out::Changes {
 				join_topic,
 				ids,
 				data: data.clone(),

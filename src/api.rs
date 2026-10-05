@@ -160,10 +160,13 @@ async fn websocket(
 	};
 	// 4 KiB buffers, not the default 128 KiB each way, which let a thousand sockets hold up to
 	// 256 MiB between them. A frame is still read or written whole, whatever its size, and every
-	// frame is flushed as it is sent.
+	// frame is flushed as it is sent. A frame or message over the pinned server's 5 MB is refused
+	// and the socket closed, where tungstenite would otherwise read up to 64 MiB of it.
 	upgrade
 		.read_buffer_size(4096)
 		.write_buffer_size(4096)
+		.max_frame_size(socket::MAX_FRAME_SIZE)
+		.max_message_size(socket::MAX_FRAME_SIZE)
 		.on_upgrade(move |ws| socket::serve(app, ws, accepted))
 }
 
