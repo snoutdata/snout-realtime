@@ -6,19 +6,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Map, Value, json};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use uuid::Uuid;
 
 use crate::App;
 use crate::changes::{self, Binding};
 use crate::db::{self, AuthContext, Policies};
-use crate::hub::{self, Out, Sub, TenantRt, TopicKey};
+use crate::hub::{self, Inbox, Out, Outbox, Sub, TenantRt, TopicKey};
 use crate::inspect::{self, Event, Kind};
 use crate::jwt;
 use crate::protocol::{self, Frame, Inbound, InboundPayload, Vsn};
@@ -28,6 +27,42 @@ const CONFIRM_TOKEN_EVERY: Duration = Duration::from_secs(300);
 /// Client presence calls allowed per window before the channel is shut (the pinned server's).
 const PRESENCE_CALLS: u32 = 5;
 const PRESENCE_WINDOW: Duration = Duration::from_secs(30);
+/// A socket with no frame from its client for this long is closed: Phoenix's websocket default,
+/// and realtime-js heartbeats every 25 seconds.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long one frame may take to be written before the client is taken to have stopped
+/// reading (the `send_timeout` the pinned server's listener has).
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The largest frame, and message, read from a client: the pinned server's `max_frame_size`.
+/// Without it tungstenite reads up to 64 MiB into memory per frame.
+pub const MAX_FRAME_SIZE: usize = 5_000_000;
+
+/// The largest payload a project allows, in bytes: its `max_payload_size_in_kb` plus the pinned
+/// server's 500 bytes of padding.
+pub fn payload_limit(max_payload_size_in_kb: i64) -> i64 {
+	max_payload_size_in_kb
+		.saturating_mul(1000)
+		.saturating_add(500)
+}
+
+/// Whether a `track` payload is over the project's payload limit, measured as it is serialised.
+fn presence_too_large(body: &Map<String, Value>, max_payload_size_in_kb: i64) -> bool {
+	let size = serde_json::to_vec(body)
+		.map(|v| v.len())
+		.unwrap_or(usize::MAX);
+	size as i64 > payload_limit(max_payload_size_in_kb)
+}
+
+/// Whether a channel may see presence (the state, and every diff after it). A private channel
+/// needs its presence read policy; a public one always may.
+fn can_read_presence(private: bool, policies: &Policies) -> bool {
+	!private || policies.presence_read == Some(true)
+}
+
+/// Whether a channel is sent a hub broadcast of `event`.
+fn may_receive(private: bool, policies: &Policies, event: &str) -> bool {
+	event != "presence_diff" || can_read_presence(private, policies)
+}
 
 pub fn now_secs() -> i64 {
 	SystemTime::now()
@@ -74,14 +109,14 @@ struct Socket {
 	vsn: Vsn,
 	token: String,
 	headers: Map<String, Value>,
-	tx: UnboundedSender<Out>,
+	tx: Outbox,
 	channels: HashMap<String, Channel>,
 	/// Frames waiting to go out.
 	out: Vec<Frame>,
 }
 
 pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
-	let (tx, mut rx) = unbounded_channel();
+	let (tx, mut rx) = hub::outbox();
 	let id = app.hub.next_id();
 	let seen = accepted
 		.rt
@@ -101,8 +136,10 @@ pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 		out: Vec::new(),
 	};
 	let (mut sink, mut stream) = ws.split();
+	let mut last_inbound = Instant::now();
 	loop {
 		let next_confirm = s.channels.values().map(|c| c.confirm_at).min();
+		let idle_at = last_inbound + IDLE_TIMEOUT;
 		let wait = async {
 			match next_confirm {
 				Some(at) => tokio::time::sleep_until(at.into()).await,
@@ -113,6 +150,7 @@ pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 			incoming = stream.next() => {
 				if matches!(incoming, Some(Ok(_))) {
 					seen.store(inspect::now_ms(), Ordering::Relaxed);
+					last_inbound = Instant::now();
 				}
 				match incoming {
 					Some(Ok(WsMessage::Text(text))) => {
@@ -146,6 +184,13 @@ pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 				}
 			}
 			out = rx.recv() => {
+				if rx.overflowed() {
+					let (n, bytes) = rx.queued();
+					ended = format!(
+						"the client fell too far behind ({n} messages, {bytes} bytes waiting)"
+					);
+					break;
+				}
 				match out {
 					Some(Out::Disconnect) | None => {
 						ended = "closed by the server (the project's Realtime settings were reset)".to_string();
@@ -155,8 +200,19 @@ pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 				}
 			}
 			_ = wait => s.confirm_tokens().await,
+			_ = tokio::time::sleep_until(idle_at.into()) => {
+				ended = format!("no frame from the client for {} s", IDLE_TIMEOUT.as_secs());
+				break;
+			}
 		}
-		if !s.flush(&mut sink).await {
+		let written = write_frames(
+			&mut sink,
+			s.out.drain(..),
+			&s.rt.counters.output_bytes,
+			WRITE_TIMEOUT,
+		)
+		.await;
+		if !written {
 			ended = "the client could not be written to".to_string();
 			break;
 		}
@@ -165,41 +221,47 @@ pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 	s.rt.socket_closed(s.id);
 	s.rt.log
 		.push(Event::new(Kind::Disconnect).socket(s.id).reason(ended));
-	let _ = sink.close().await;
+	// A client that stopped reading would park the close here for good, as it parked the writes.
+	let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.close()).await;
 	drain(&mut rx);
 }
 
-fn drain(rx: &mut UnboundedReceiver<Out>) {
-	while rx.try_recv().is_ok() {}
+fn drain(rx: &mut Inbox) {
+	while rx.try_recv().is_some() {}
+}
+
+/// Write frames in order, each within `timeout`; false when one could not be written (the
+/// client is gone, or has stopped reading).
+async fn write_frames<S>(
+	sink: &mut S,
+	frames: impl IntoIterator<Item = Frame>,
+	output_bytes: &AtomicU64,
+	timeout: Duration,
+) -> bool
+where
+	S: Sink<WsMessage> + Unpin,
+{
+	for frame in frames {
+		let (msg, len) = match frame {
+			Frame::Text(t) => {
+				let n = t.len();
+				(WsMessage::Text(t.into()), n)
+			}
+			Frame::Binary(b) => {
+				let n = b.len();
+				(WsMessage::Binary(b.into()), n)
+			}
+		};
+		output_bytes.fetch_add(len as u64, Ordering::Relaxed);
+		match tokio::time::timeout(timeout, sink.send(msg)).await {
+			Ok(Ok(())) => {}
+			_ => return false,
+		}
+	}
+	true
 }
 
 impl Socket {
-	async fn flush(
-		&mut self,
-		sink: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
-	) -> bool {
-		for frame in self.out.drain(..) {
-			let (msg, len) = match frame {
-				Frame::Text(t) => {
-					let n = t.len();
-					(WsMessage::Text(t.into()), n)
-				}
-				Frame::Binary(b) => {
-					let n = b.len();
-					(WsMessage::Binary(b.into()), n)
-				}
-			};
-			self.rt
-				.counters
-				.output_bytes
-				.fetch_add(len as u64, Ordering::Relaxed);
-			if sink.send(msg).await.is_err() {
-				return false;
-			}
-		}
-		true
-	}
-
 	fn push(&mut self, frame: Frame) {
 		self.out.push(frame);
 	}
@@ -289,7 +351,7 @@ impl Socket {
 				let name = channel.name.clone();
 				let join_ref = channel.join_ref.clone();
 				let presence = channel.presence_enabled
-					&& (!channel.private || channel.policies.presence_read == Some(true));
+					&& can_read_presence(channel.private, &channel.policies);
 				let key = channel.key.clone();
 				let bindings = channel.bindings.clone();
 				let claims = channel.auth.claims.clone();
@@ -907,7 +969,7 @@ impl Socket {
 			}
 		}
 		let tenant = self.rt.tenant();
-		let max = tenant.max_payload_size_in_kb * 1000 + 500;
+		let max = payload_limit(tenant.max_payload_size_in_kb);
 		let size = match &m.payload {
 			InboundPayload::Json(v) => v.to_string().len() as i64,
 			InboundPayload::Bytes(b) => b.len() as i64,
@@ -1005,6 +1067,13 @@ impl Socket {
 						return;
 					}
 				}
+				// Kept in memory for the channel's life, so held to the payload limit a
+				// broadcast is; over it the channel is shut, as the pinned server shuts it.
+				if presence_too_large(&body, self.rt.tenant().max_payload_size_in_kb) {
+					let topic = m.topic.clone();
+					self.shutdown(&topic, "Track message size exceeded").await;
+					return;
+				}
 				let Some(ch) = self.channels.get_mut(&m.topic) else {
 					return;
 				};
@@ -1021,8 +1090,7 @@ impl Socket {
 					ch.presence_key.clone(),
 					ch.join_ref.clone(),
 				);
-				let private = ch.private;
-				let can_read = !private || ch.policies.presence_read == Some(true);
+				let can_read = can_read_presence(ch.private, &ch.policies);
 				self.reply(&m, "ok", json!({}));
 				// Enabling presence by tracking sends the state first, so the members already
 				// there are seen.
@@ -1070,8 +1138,14 @@ impl Socket {
 				join_topic,
 				event,
 				payload,
+				..
 			} => {
-				if !self.channels.contains_key(&join_topic) {
+				// A presence diff carries other members' keys and payloads: a private channel
+				// whose policy refuses presence read is sent none, as it is sent no state.
+				let Some(ch) = self.channels.get(&join_topic) else {
+					return;
+				};
+				if !may_receive(ch.private, &ch.policies, &event) {
 					return;
 				}
 				let f = protocol::broadcast(self.vsn, &join_topic, &event, (*payload).clone());
@@ -1142,5 +1216,109 @@ impl Socket {
 			}
 			Out::Disconnect => {}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::pin::Pin;
+	use std::task::{Context, Poll};
+
+	use super::*;
+
+	/// A client that never reads: the socket never becomes writable again.
+	struct Stalled;
+
+	impl Sink<WsMessage> for Stalled {
+		type Error = ();
+		fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+			Poll::Pending
+		}
+		fn start_send(self: Pin<&mut Self>, _: WsMessage) -> Result<(), ()> {
+			Ok(())
+		}
+		fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+			Poll::Pending
+		}
+		fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+			Poll::Pending
+		}
+	}
+
+	#[tokio::test]
+	async fn a_client_that_stops_reading_is_given_up_on() {
+		let bytes = AtomicU64::new(0);
+		let started = Instant::now();
+		let written = write_frames(
+			&mut Stalled,
+			vec![Frame::Text("x".into())],
+			&bytes,
+			Duration::from_millis(50),
+		)
+		.await;
+		assert!(!written);
+		assert!(started.elapsed() < Duration::from_secs(5));
+	}
+
+	#[tokio::test]
+	async fn a_client_that_reads_is_written_to() {
+		let bytes = AtomicU64::new(0);
+		let mut sink = futures_util::sink::drain();
+		let frames = vec![Frame::Text("abc".into()), Frame::Binary(vec![1, 2])];
+		assert!(write_frames(&mut sink, frames, &bytes, WRITE_TIMEOUT).await);
+		assert_eq!(bytes.load(Ordering::Relaxed), 5);
+	}
+
+	#[test]
+	fn the_timeouts_are_the_pinned_servers() {
+		assert_eq!(IDLE_TIMEOUT, Duration::from_secs(60));
+		assert_eq!(WRITE_TIMEOUT, Duration::from_secs(30));
+	}
+
+	#[test]
+	fn a_presence_payload_is_held_to_the_payload_limit() {
+		let mut small = Map::new();
+		small.insert("user".into(), json!("ada"));
+		assert!(!presence_too_large(&small, 1));
+		let mut big = Map::new();
+		big.insert("p".into(), json!("a".repeat(1600)));
+		assert!(presence_too_large(&big, 1));
+		// The same payload under the default 3,000 KB limit, and the attack's 60 MB over it.
+		assert!(!presence_too_large(&big, 3000));
+		let mut huge = Map::new();
+		huge.insert("p".into(), json!("a".repeat(3_000_501)));
+		assert!(presence_too_large(&huge, 3000));
+	}
+
+	#[test]
+	fn a_frame_may_carry_the_default_payload_and_no_more_than_the_pinned_server_reads() {
+		assert_eq!(MAX_FRAME_SIZE, 5_000_000);
+		assert!(MAX_FRAME_SIZE as i64 > payload_limit(3000));
+		assert_eq!(payload_limit(3000), 3_000_500);
+	}
+
+	#[test]
+	fn a_private_channel_without_presence_read_gets_no_presence_diff() {
+		let refused = Policies {
+			broadcast_read: Some(true),
+			presence_read: Some(false),
+			..Policies::default()
+		};
+		let unasked = Policies {
+			broadcast_read: Some(true),
+			..Policies::default()
+		};
+		let allowed = Policies {
+			broadcast_read: Some(true),
+			presence_read: Some(true),
+			..Policies::default()
+		};
+		assert!(!may_receive(true, &refused, "presence_diff"));
+		assert!(!may_receive(true, &unasked, "presence_diff"));
+		assert!(may_receive(true, &allowed, "presence_diff"));
+		// Broadcasts are decided at join, by the broadcast read policy.
+		assert!(may_receive(true, &refused, "broadcast"));
+		// A public channel has no policies to consult.
+		assert!(may_receive(false, &Policies::default(), "presence_diff"));
 	}
 }

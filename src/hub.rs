@@ -7,11 +7,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::inspect;
 use crate::presence::{self, Diff, SubscriberId};
@@ -34,6 +34,8 @@ pub enum Out {
 		join_topic: String,
 		event: String,
 		payload: Arc<Value>,
+		/// The payload's serialised length, measured once for every subscriber.
+		size: usize,
 	},
 	/// A user broadcast whose payload is carried as it arrived (V2 binary kind 4).
 	User {
@@ -62,13 +64,165 @@ pub enum Out {
 	Disconnect,
 }
 
+impl Out {
+	/// Roughly what holding this in a queue costs, in bytes. Shared payloads are counted on every
+	/// queue holding them, which overstates the memory and never understates it.
+	fn cost(&self) -> usize {
+		const ENVELOPE: usize = 64;
+		ENVELOPE
+			+ match self {
+				Out::Broadcast {
+					join_topic,
+					event,
+					size,
+					..
+				} => join_topic.len() + event.len() + size,
+				Out::User {
+					join_topic,
+					event,
+					payload,
+					..
+				} => join_topic.len() + event.len() + payload.len(),
+				Out::Changes {
+					join_topic,
+					ids,
+					data,
+				} => join_topic.len() + ids.len() * 8 + data.len(),
+				Out::System {
+					join_topic,
+					message,
+					..
+				} => join_topic.len() + message.len(),
+				Out::Disconnect => 0,
+			}
+	}
+}
+
+/// Messages one socket may have waiting to be written before it is dropped.
+pub const MAX_QUEUED: usize = 8192;
+/// Bytes one socket may have waiting to be written before it is dropped. One message larger
+/// than this is still accepted into an empty queue.
+pub const MAX_QUEUED_BYTES: usize = 16 << 20;
+
+#[derive(Debug)]
+struct QueueState {
+	len: AtomicUsize,
+	bytes: AtomicUsize,
+	overflowed: AtomicBool,
+	max_len: usize,
+	max_bytes: usize,
+}
+
+/// The sending half of one socket's outbound queue. Bounded by count and by bytes: a socket
+/// whose client stops reading would otherwise hold everything sent to it, at the database's
+/// write speed, until the process (and every project on the host) ran out of memory. Past the
+/// bound the queue refuses everything and the socket closes itself.
+#[derive(Debug, Clone)]
+pub struct Outbox {
+	tx: UnboundedSender<Out>,
+	state: Arc<QueueState>,
+}
+
+/// The receiving half, read by the socket's own task.
+#[derive(Debug)]
+pub struct Inbox {
+	rx: UnboundedReceiver<Out>,
+	state: Arc<QueueState>,
+}
+
+/// A socket's outbound queue at the standard bounds.
+pub fn outbox() -> (Outbox, Inbox) {
+	outbox_with(MAX_QUEUED, MAX_QUEUED_BYTES)
+}
+
+pub fn outbox_with(max_len: usize, max_bytes: usize) -> (Outbox, Inbox) {
+	let (tx, rx) = unbounded_channel();
+	let state = Arc::new(QueueState {
+		len: AtomicUsize::new(0),
+		bytes: AtomicUsize::new(0),
+		overflowed: AtomicBool::new(false),
+		max_len,
+		max_bytes,
+	});
+	(
+		Outbox {
+			tx,
+			state: state.clone(),
+		},
+		Inbox { rx, state },
+	)
+}
+
+impl Outbox {
+	/// Queue `out`; false when it was not (the socket is gone, or too far behind). `Disconnect`
+	/// is never refused.
+	pub fn send(&self, out: Out) -> bool {
+		if matches!(out, Out::Disconnect) {
+			return self.tx.send(out).is_ok();
+		}
+		let s = &self.state;
+		if s.overflowed.load(Ordering::Acquire) {
+			return false;
+		}
+		let cost = out.cost();
+		let len = s.len.fetch_add(1, Ordering::AcqRel) + 1;
+		let bytes = s.bytes.fetch_add(cost, Ordering::AcqRel) + cost;
+		if len > s.max_len || (bytes > s.max_bytes && len > 1) {
+			s.len.fetch_sub(1, Ordering::AcqRel);
+			s.bytes.fetch_sub(cost, Ordering::AcqRel);
+			s.overflowed.store(true, Ordering::Release);
+			return false;
+		}
+		if self.tx.send(out).is_err() {
+			s.len.fetch_sub(1, Ordering::AcqRel);
+			s.bytes.fetch_sub(cost, Ordering::AcqRel);
+			return false;
+		}
+		true
+	}
+}
+
+impl Inbox {
+	pub async fn recv(&mut self) -> Option<Out> {
+		let out = self.rx.recv().await?;
+		self.release(&out);
+		Some(out)
+	}
+
+	pub fn try_recv(&mut self) -> Option<Out> {
+		let out = self.rx.try_recv().ok()?;
+		self.release(&out);
+		Some(out)
+	}
+
+	fn release(&self, out: &Out) {
+		if !matches!(out, Out::Disconnect) {
+			self.state.len.fetch_sub(1, Ordering::AcqRel);
+			self.state.bytes.fetch_sub(out.cost(), Ordering::AcqRel);
+		}
+	}
+
+	/// Whether a send was refused for the bound: the socket has fallen too far behind.
+	pub fn overflowed(&self) -> bool {
+		self.state.overflowed.load(Ordering::Acquire)
+	}
+
+	/// Messages and bytes waiting.
+	pub fn queued(&self) -> (usize, usize) {
+		(
+			self.state.len.load(Ordering::Acquire),
+			self.state.bytes.load(Ordering::Acquire),
+		)
+	}
+}
+
 /// A subscriber on a topic: one channel on one socket.
 #[derive(Debug, Clone)]
 pub struct Sub {
 	pub id: SubscriberId,
 	pub socket: u64,
 	pub join_topic: String,
-	pub tx: UnboundedSender<Out>,
+	pub tx: Outbox,
 	/// Message ids replayed at join, not to be delivered again live.
 	pub replayed: Arc<HashSet<String>>,
 	/// The presence key this channel tracks under (the client's, or one made for it).
@@ -114,7 +268,7 @@ pub struct Counters {
 }
 
 /// An open socket: the client's address, its queue, and when a frame last arrived from it.
-type SocketEntry = (Option<String>, UnboundedSender<Out>, Arc<AtomicI64>);
+type SocketEntry = (Option<String>, Outbox, Arc<AtomicI64>);
 
 /// A user broadcast to deliver: its event, its payload as it arrived, and the metadata a stored
 /// message carries (`{ id }`), whose id also keeps a replayed message from arriving twice.
@@ -261,17 +415,20 @@ impl TenantRt {
 		if diff.is_empty() {
 			return;
 		}
-		let payload = Arc::new(diff.payload());
+		let payload = diff.payload();
+		let size = payload.to_string().len();
+		let payload = Arc::new(payload);
 		let subs = self.subscribers(key, except);
 		self.record(key, |w| w.presence(subs.len()));
 		self.counters
 			.presence_events
 			.fetch_add(subs.len() as u64, Ordering::Relaxed);
 		for s in subs {
-			let _ = s.tx.send(Out::Broadcast {
+			s.tx.send(Out::Broadcast {
 				join_topic: s.join_topic.clone(),
 				event: "presence_diff".into(),
 				payload: payload.clone(),
+				size,
 			});
 		}
 	}
@@ -306,7 +463,7 @@ impl TenantRt {
 		&self,
 		socket: u64,
 		address: Option<String>,
-		tx: UnboundedSender<Out>,
+		tx: Outbox,
 	) -> Arc<AtomicI64> {
 		let seen = Arc::new(AtomicI64::new(inspect::now_ms()));
 		self.sockets
@@ -418,7 +575,7 @@ impl TenantRt {
 			.unwrap_or_else(|e| e.into_inner())
 			.values()
 		{
-			let _ = tx.send(Out::Disconnect);
+			tx.send(Out::Disconnect);
 		}
 	}
 }
@@ -507,7 +664,7 @@ pub fn deliver_user(
 			continue;
 		}
 		n += 1;
-		let _ = s.tx.send(Out::User {
+		s.tx.send(Out::User {
 			join_topic: s.join_topic.clone(),
 			event: event.clone(),
 			encoding,
@@ -529,16 +686,96 @@ pub fn deliver_json(
 	payload: Value,
 ) -> usize {
 	let subs = rt.subscribers(key, except);
+	let size = payload.to_string().len();
 	let payload = Arc::new(payload);
 	let n = subs.len();
 	for s in subs {
-		let _ = s.tx.send(Out::Broadcast {
+		s.tx.send(Out::Broadcast {
 			join_topic: s.join_topic.clone(),
 			event: "broadcast".into(),
 			payload: payload.clone(),
+			size,
 		});
 	}
 	rt.counters.events.fetch_add(n as u64, Ordering::Relaxed);
 	rt.record(key, |w| w.broadcast(n));
 	n
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn change(bytes: usize) -> Out {
+		Out::Changes {
+			join_topic: "realtime:x".into(),
+			ids: vec![1],
+			data: Arc::from("a".repeat(bytes)),
+		}
+	}
+
+	#[tokio::test]
+	async fn a_queue_past_its_count_refuses_and_says_so() {
+		let (tx, mut rx) = outbox_with(3, usize::MAX);
+		for _ in 0..3 {
+			assert!(tx.send(change(1)));
+		}
+		assert!(!rx.overflowed());
+		assert!(!tx.send(change(1)));
+		assert!(rx.overflowed());
+		// Once over, it stays over: the socket is dropped, not slowed.
+		assert!(rx.recv().await.is_some());
+		assert!(!tx.send(change(1)));
+		assert_eq!(rx.queued().0, 2);
+	}
+
+	#[tokio::test]
+	async fn a_queue_past_its_bytes_refuses() {
+		let (tx, rx) = outbox_with(usize::MAX, 10_000);
+		assert!(tx.send(change(4_000)));
+		assert!(tx.send(change(4_000)));
+		assert!(!tx.send(change(4_000)));
+		assert!(rx.overflowed());
+	}
+
+	#[tokio::test]
+	async fn one_message_larger_than_the_bound_still_reaches_an_empty_queue() {
+		let (tx, mut rx) = outbox_with(10, 1_000);
+		assert!(tx.send(change(5_000)));
+		assert!(!rx.overflowed());
+		assert!(rx.recv().await.is_some());
+		assert_eq!(rx.queued(), (0, 0));
+		assert!(tx.send(change(5_000)));
+	}
+
+	#[tokio::test]
+	async fn reading_makes_room() {
+		let (tx, mut rx) = outbox_with(2, usize::MAX);
+		for _ in 0..10 {
+			assert!(tx.send(change(10)));
+			assert!(tx.send(change(10)));
+			assert!(rx.recv().await.is_some());
+			assert!(rx.recv().await.is_some());
+		}
+		assert!(!rx.overflowed());
+		assert_eq!(rx.queued(), (0, 0));
+	}
+
+	#[tokio::test]
+	async fn a_disconnect_is_never_refused() {
+		let (tx, mut rx) = outbox_with(1, usize::MAX);
+		assert!(tx.send(change(1)));
+		assert!(!tx.send(change(1)));
+		assert!(tx.send(Out::Disconnect));
+		assert!(matches!(rx.recv().await, Some(Out::Changes { .. })));
+		assert!(matches!(rx.recv().await, Some(Out::Disconnect)));
+	}
+
+	#[test]
+	fn a_queue_whose_socket_is_gone_refuses_without_counting() {
+		let (tx, rx) = outbox_with(10, usize::MAX);
+		drop(rx);
+		assert!(!tx.send(change(1)));
+		assert_eq!(tx.state.len.load(Ordering::Acquire), 0);
+	}
 }
