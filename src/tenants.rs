@@ -2,8 +2,7 @@
 //! metadata database.
 //!
 //! **In a schema of its own (`snout_realtime`).** The host agent lists
-//! the tenants on every reconcile and registers any this server does not know (`planRealtime`
-//! in `packages/snoutpod/src/host/realtime.ts`), so a swap to this server re-registers every
+//! the tenants on every reconcile and registers any this server does not know, so a swap to this server re-registers every
 //! project within one tick, and a swap back finds the previous server's rows as it left them: the
 //! rollback costs nothing.
 //!
