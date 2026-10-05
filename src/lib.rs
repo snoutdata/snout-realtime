@@ -56,7 +56,7 @@ pub async fn upkeep(app: std::sync::Arc<App>) {
 	}
 }
 
-/// The entry points the fuzz targets drive (`packages/stack/fuzz`): every parser of bytes a
+/// The entry points the fuzz targets drive: every parser of bytes a
 /// client or the database sends. Each must return, whatever it is given; a panic, a hang or an
 /// allocation blow-up is the failure.
 pub mod fuzz {
