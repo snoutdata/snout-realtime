@@ -107,29 +107,7 @@ impl Databases {
 		{
 			return Ok(pool.clone());
 		}
-		let mut config = tokio_postgres::Config::new();
-		config
-			.host(&db.host)
-			.port(db.port)
-			.dbname(&db.name)
-			.user(&db.user)
-			.password(&db.password)
-			.application_name("snout_realtime")
-			.connect_timeout(Duration::from_secs(10));
-		let manager = Manager::from_config(
-			config,
-			NoTls,
-			ManagerConfig {
-				recycling_method: RecyclingMethod::Fast,
-			},
-		);
-		let pool = Pool::builder(manager)
-			.max_size(4)
-			.runtime(Runtime::Tokio1)
-			.wait_timeout(Some(Duration::from_secs(10)))
-			.create_timeout(Some(Duration::from_secs(10)))
-			.build()
-			.map_err(|e| DbError::Unavailable(e.to_string()))?;
+		let pool = new_pool(db, 4)?;
 		pools.insert(tenant.to_string(), (db.clone(), pool.clone()));
 		Ok(pool)
 	}
@@ -138,6 +116,33 @@ impl Databases {
 	pub async fn forget(&self, tenant: &str) {
 		self.pools.lock().await.remove(tenant);
 	}
+}
+
+/// A pool of at most `size` connections to one database, each made when first asked for.
+pub fn new_pool(db: &Database, size: usize) -> Result<Pool, DbError> {
+	let mut config = tokio_postgres::Config::new();
+	config
+		.host(&db.host)
+		.port(db.port)
+		.dbname(&db.name)
+		.user(&db.user)
+		.password(&db.password)
+		.application_name("snout_realtime")
+		.connect_timeout(Duration::from_secs(10));
+	let manager = Manager::from_config(
+		config,
+		NoTls,
+		ManagerConfig {
+			recycling_method: RecyclingMethod::Fast,
+		},
+	);
+	Pool::builder(manager)
+		.max_size(size)
+		.runtime(Runtime::Tokio1)
+		.wait_timeout(Some(Duration::from_secs(10)))
+		.create_timeout(Some(Duration::from_secs(10)))
+		.build()
+		.map_err(|e| DbError::Unavailable(e.to_string()))
 }
 
 /// Make a project ready: its realtime schema (only when it has none: one the pinned server set up

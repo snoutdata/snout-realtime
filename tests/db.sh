@@ -12,7 +12,7 @@ pg="snout-realtime-pg-$$"
 
 "$engine" network create "$net" >/dev/null
 cleanup() {
-	"$engine" rm -f "$pg" >/dev/null 2>&1 || true
+	"$engine" rm -fv "$pg" >/dev/null 2>&1 || true
 	"$engine" network rm "$net" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
