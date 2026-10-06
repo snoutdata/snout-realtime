@@ -11,6 +11,9 @@
 //!  - Nothing is streamed, and no slot is held, while nobody is subscribed.
 //!  - The slot is TEMPORARY: it lives as long as the stream's own connection, so a process that
 //!    dies holds no WAL.
+//!  - A SHARDED project (snout-lepis) has one stream per node, merged into the same subscribers:
+//!    `cluster.rs` says which, and how a change Lepis made while moving rows is told apart from
+//!    one somebody made.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +24,7 @@ use serde_json::{Map, Value};
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
+use crate::cluster;
 use crate::db::quote_ident;
 use crate::hub::{Out, Outbox, TenantRt};
 use crate::pgoutput::{self, Message, Old, Relation};
@@ -50,6 +54,10 @@ struct Listener {
 	schema: String,
 	table: String,
 	action: String,
+	/// The binding and the claims it is checked as, to write its row again on a node whose stream
+	/// opens after it subscribed.
+	binding: Binding,
+	claims: Value,
 }
 
 /// A project's postgres_changes: who is subscribed, and the stream.
@@ -64,6 +72,10 @@ pub struct Changes {
 	/// derived password): the stream stops, and the next join makes a new one. Without it the
 	/// retry loop below spun forever on the old password while any listener was left.
 	retired: std::sync::atomic::AtomicBool,
+	/// A sharded project's nodes and sharded tables, as the follower last read them.
+	shape: std::sync::RwLock<Option<Arc<cluster::Shape>>>,
+	/// The other nodes whose streams are open, by node id, with a pool for their subscription rows.
+	nodes: std::sync::Mutex<HashMap<i32, deadpool_postgres::Pool>>,
 }
 
 /// The id a binding is known by. A stable hash of its parameters, so the same binding gets the
@@ -256,6 +268,22 @@ on conflict (subscription_id, entity, filters, action_filter, coalesce(selected_
 do update set claims = excluded.claims, created_at = now()
 returning id";
 
+const RECLAIM_SQL: &str =
+	"update realtime.subscription set claims = $1 where subscription_id = any($2::text[]::uuid[])";
+
+/// Which stream a loop is reading. `node` is `None` for the database the tenant is registered with
+/// (every project's one stream; a sharded project's home node), and the node's id otherwise.
+/// `cluster` is whether the project is sharded (`cluster.rs`).
+#[derive(Debug, Clone, Copy)]
+struct Scope {
+	node: Option<i32>,
+	cluster: bool,
+}
+
+/// How often the one stream of an unsharded project looks for a `lepis` catalog, so a project
+/// sharded while it has subscribers is followed onto its new nodes without waiting to go idle.
+const PROBE_EVERY: Duration = Duration::from_secs(30);
+
 impl Changes {
 	pub fn new(database: Database) -> Arc<Changes> {
 		Arc::new(Changes {
@@ -265,6 +293,8 @@ impl Changes {
 			ready: Notify::new(),
 			running: false.into(),
 			retired: false.into(),
+			shape: std::sync::RwLock::new(None),
+			nodes: std::sync::Mutex::new(HashMap::new()),
 		})
 	}
 
@@ -278,6 +308,39 @@ impl Changes {
 		self.retired.store(true, Ordering::SeqCst);
 	}
 
+	/// Whether `retire` was called.
+	pub fn is_retired(&self) -> bool {
+		self.retired.load(Ordering::SeqCst)
+	}
+
+	/// A sharded project's shape as last read (`cluster.rs`); `None` for every other project.
+	pub fn shape(&self) -> Option<Arc<cluster::Shape>> {
+		self.shape.read().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
+	pub(crate) fn set_shape(&self, shape: Option<Arc<cluster::Shape>>) {
+		*self.shape.write().unwrap_or_else(|e| e.into_inner()) = shape;
+	}
+
+	fn is_sharded(&self, schema: &str, table: &str) -> bool {
+		self.shape
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.as_ref()
+			.is_some_and(|s| s.is_sharded(schema, table))
+	}
+
+	/// The other nodes whose streams are open, each with the pool its subscription rows are
+	/// written through.
+	fn node_pools(&self) -> Vec<(i32, deadpool_postgres::Pool)> {
+		self.nodes
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.iter()
+			.map(|(id, pool)| (*id, pool.clone()))
+			.collect()
+	}
+
 	/// Insert a channel's bindings, all or none. The error is the sentence the client gets.
 	pub async fn subscribe(
 		self: &Arc<Self>,
@@ -288,11 +351,14 @@ impl Changes {
 		tx: Outbox,
 		join_topic: &str,
 	) -> Result<(), String> {
-		self.ensure_stream(rt).await;
+		self.ensure_stream(rt.clone()).await;
 		static CHANNELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 		let channel = CHANNELS.fetch_add(1, Ordering::Relaxed);
+		let stored = Value::Object(claims.clone());
 		// Listening BEFORE the rows exist: the stream's sweep of rows that are not its own
-		// (`sweep`) holds this lock, so a row is either written after it or known to it.
+		// (`sweep`) holds this lock, so a row is either written after it or known to it. A node's
+		// stream writes the rows of every listener there is when it opens (`adopt`), under the
+		// same lock.
 		{
 			let mut listeners = self.listeners.lock().await;
 			for b in bindings {
@@ -306,85 +372,44 @@ impl Changes {
 						schema: b.schema.clone(),
 						table: b.table.clone(),
 						action: b.action.clone(),
+						binding: b.clone(),
+						claims: stored.clone(),
 					},
 				);
 			}
 		}
-		let result = self.insert_bindings(pool, claims, bindings).await;
+		let result =
+			insert_bindings(pool, &self.database.publication, &stored, bindings, true).await;
+		let nodes = self.node_pools();
 		if result.is_err() {
 			let mut listeners = self.listeners.lock().await;
-			for b in bindings {
-				listeners.remove(&b.subscription_id);
+			let ids: Vec<Uuid> = bindings.iter().map(|b| b.subscription_id).collect();
+			for id in &ids {
+				listeners.remove(id);
+			}
+			drop(listeners);
+			for (_, node) in &nodes {
+				forget_rows(node, &ids).await;
+			}
+		} else {
+			// The same rows on every other node, for the changes that happen there. A table a node
+			// does not stream is in no publication of its, and matches nothing.
+			for (node, node_pool) in &nodes {
+				if let Err(e) = insert_bindings(
+					node_pool,
+					&self.database.publication,
+					&stored,
+					bindings,
+					false,
+				)
+				.await
+				{
+					tracing::warn!(tenant = %rt.id, node, error = %e, "a subscription could not be written on a node; it is written again when that node's stream next opens");
+				}
 			}
 		}
 		self.wake.notify_one();
 		result
-	}
-
-	async fn insert_bindings(
-		&self,
-		pool: &deadpool_postgres::Pool,
-		claims: &Map<String, Value>,
-		bindings: &[Binding],
-	) -> Result<(), String> {
-		let mut client = pool
-			.get()
-			.await
-			.map_err(|e| format!("Unable to subscribe to changes: {e}"))?;
-		let t = client.transaction().await.map_err(|e| e.to_string())?;
-		let claims = Value::Object(claims.clone());
-		for b in bindings {
-			let filters = Value::Array(
-				b.filters
-					.iter()
-					.map(|(c, o, v)| {
-						Value::Array(vec![c.clone().into(), o.clone().into(), v.clone().into()])
-					})
-					.collect(),
-			);
-			let result = t
-				.query(
-					INSERT_SQL,
-					&[
-						&self.database.publication,
-						&b.schema,
-						&b.table,
-						&b.subscription_id.to_string(),
-						&claims,
-						&filters,
-						&b.action,
-						&b.selected,
-					],
-				)
-				.await;
-			match result {
-				Ok(rows) if !rows.is_empty() => {}
-				Ok(_) => {
-					return Err(format!(
-						"Unable to subscribe to changes with given parameters. Please check Realtime is enabled for the given connect parameters: [{}]",
-						describe(b)
-					));
-				}
-				Err(e) => {
-					let detail = match e.as_db_error() {
-						Some(db) => format!(
-							"ERROR {} ({}) {}",
-							db.code().code(),
-							condition_name(db.code().code()),
-							db.message()
-						),
-						None => e.to_string(),
-					};
-					return Err(format!(
-						"Unable to subscribe to changes with given parameters. An exception happened so please check your connect parameters: [{}]. Exception: {}",
-						describe(b),
-						detail
-					));
-				}
-			}
-		}
-		t.commit().await.map_err(|e| e.to_string())?;
-		Ok(())
 	}
 
 	/// A channel's token changed: its bindings are checked as the new claims from the next change
@@ -399,15 +424,28 @@ impl Changes {
 		if ids.is_empty() {
 			return Ok(());
 		}
+		let claims = Value::Object(claims.clone());
+		let text: Vec<String> = ids.iter().map(Uuid::to_string).collect();
 		let client = pool.get().await.map_err(|e| e.to_string())?;
-		let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
 		client
-			.execute(
-				"update realtime.subscription set claims = $1 where subscription_id = any($2::text[]::uuid[])",
-				&[&Value::Object(claims.clone()), &ids],
-			)
+			.execute(RECLAIM_SQL, &[&claims, &text])
 			.await
 			.map_err(|e| e.to_string())?;
+		drop(client);
+		{
+			let mut listeners = self.listeners.lock().await;
+			for id in ids {
+				if let Some(l) = listeners.get_mut(id) {
+					l.claims = claims.clone();
+				}
+			}
+		}
+		// A node that cannot be reached now is given the new claims when its stream opens again.
+		for (_, node) in self.node_pools() {
+			if let Ok(client) = node.get().await {
+				let _ = client.execute(RECLAIM_SQL, &[&claims, &text]).await;
+			}
+		}
 		Ok(())
 	}
 
@@ -422,6 +460,9 @@ impl Changes {
 		}
 		drop(listeners);
 		forget_rows(pool, ids).await;
+		for (_, node) in self.node_pools() {
+			forget_rows(&node, ids).await;
+		}
 	}
 
 	async fn ensure_stream(self: &Arc<Self>, rt: Arc<TenantRt>) {
@@ -431,7 +472,8 @@ impl Changes {
 		let me = self.clone();
 		let ready = self.ready.notified();
 		tokio::spawn(async move { me.run(rt).await });
-		// Wait for the slot, so no change after "Subscribed to PostgreSQL" is lost.
+		// Wait for the slot (each node's too, in a sharded project), so no change after
+		// "Subscribed to PostgreSQL" is lost.
 		let _ = tokio::time::timeout(Duration::from_secs(10), ready).await;
 	}
 
@@ -442,13 +484,13 @@ impl Changes {
 				Err(e) => {
 					tracing::warn!(tenant = %rt.id, error = %e, "database changes");
 					tokio::time::sleep(Duration::from_millis(500)).await;
-					if self.retired.load(Ordering::SeqCst) || self.listeners.lock().await.is_empty()
-					{
+					if self.is_retired() || self.listeners.lock().await.is_empty() {
 						break;
 					}
 				}
 			}
 		}
+		self.set_shape(None);
 		self.running.store(false, Ordering::SeqCst);
 	}
 
@@ -461,15 +503,15 @@ impl Changes {
 		})
 	}
 
-	/// Stream the project's changes through a temporary slot until nobody has been subscribed
-	/// for thirty seconds.
-	async fn stream_until_idle(&self, rt: &TenantRt) -> Result<(), String> {
+	/// A temporary slot on `database`, the stream started from it, and the first connection the
+	/// changes are decided on.
+	async fn open(database: &Database) -> Result<(Connection, tokio_postgres::Client), String> {
 		let target = Target {
-			host: self.database.host.clone(),
-			port: self.database.port,
-			user: self.database.user.clone(),
-			password: self.database.password.clone(),
-			database: self.database.name.clone(),
+			host: database.host.clone(),
+			port: database.port,
+			user: database.user.clone(),
+			password: database.password.clone(),
+			database: database.name.clone(),
 			application_name: "snout_realtime_changes".into(),
 		};
 		let mut conn = Connection::connect(&target)
@@ -482,16 +524,23 @@ impl Changes {
 		))
 		.await
 		.map_err(|e| e.to_string())?;
-		let publication = self.database.publication.replace('\'', "");
+		let publication = database.publication.replace('\'', "");
 		conn.start(&format!(
 			"START_REPLICATION SLOT {} LOGICAL 0/0 (proto_version '1', publication_names '{publication}')",
 			quote_ident(&slot)
 		))
 		.await
 		.map_err(|e| e.to_string())?;
-		// The first connection for the checks; a second joins it once there are many subscribers.
-		let mut checkers = vec![self.checker().await?];
-		let mut statements = vec![Statements::new()];
+		let checker = Self::checker(database).await?;
+		Ok((conn, checker))
+	}
+
+	/// Stream the project's changes through a temporary slot until nobody has been subscribed
+	/// for thirty seconds. In a sharded project the other nodes' streams are opened (`cluster.rs`)
+	/// before anybody waiting is told the stream is ready, and closed with this one.
+	async fn stream_until_idle(self: &Arc<Self>, rt: &Arc<TenantRt>) -> Result<(), String> {
+		let (mut conn, first) = Self::open(&self.database).await?;
+		let mut checkers = vec![first];
 		match self.sweep(&checkers[0]).await {
 			Ok(0) => {}
 			Ok(n) => {
@@ -501,16 +550,144 @@ impl Changes {
 				tracing::warn!(tenant = %rt.id, error = %e, "subscriptions left by an earlier server")
 			}
 		}
+		let follower = match cluster::probe(&checkers[0], &rt.id).await {
+			Some(shape) => Some(cluster::follow(self.clone(), rt.clone(), shape).await),
+			None => None,
+		};
 		self.ready.notify_waiters();
+		let database = self.database.clone();
+		self.pump(rt, &mut conn, &mut checkers, &database, follower)
+			.await
+	}
+
+	/// One node of a sharded project other than the home node: its stream, for its sharded tables
+	/// only, until it fails or the follower closes it. `ready` is set once the slot is open and the
+	/// node holds the subscription rows of every listener.
+	///
+	/// Boxed with its `Send` stated: the home stream starts the follower that starts this, and an
+	/// inferred future type would have to contain itself.
+	pub(crate) fn stream_node<'a>(
+		self: &'a Arc<Self>,
+		rt: &'a Arc<TenantRt>,
+		node: i32,
+		database: &'a Database,
+		pool: &'a deadpool_postgres::Pool,
+		ready: &'a tokio::sync::watch::Sender<bool>,
+	) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+		Box::pin(async move {
+			let (mut conn, first) = Self::open(database).await?;
+			let mut checkers = vec![first];
+			let _registered = self.adopt(rt, node, &checkers[0], pool).await?;
+			ready.send_replace(true);
+			let scope = Scope {
+				node: Some(node),
+				cluster: true,
+			};
+			self.pump_scoped(rt, &mut conn, &mut checkers, database, scope, None)
+				.await
+		})
+	}
+
+	/// A node's stream has opened: its subscription rows become exactly the listeners', and the
+	/// node is one `subscribe` writes to from now on. Under the listeners' lock, so a subscriber
+	/// is written here or there and never neither. The registration lasts as long as the guard.
+	async fn adopt(
+		self: &Arc<Self>,
+		rt: &TenantRt,
+		node: i32,
+		checker: &tokio_postgres::Client,
+		pool: &deadpool_postgres::Pool,
+	) -> Result<NodeRegistration, String> {
+		let listeners = self.listeners.lock().await;
+		let ours: Vec<String> = listeners.keys().map(Uuid::to_string).collect();
+		checker
+			.execute(
+				"delete from realtime.subscription where not (subscription_id = any($1::text[]::uuid[]))",
+				&[&ours],
+			)
+			.await
+			.map_err(|e| e.to_string())?;
+		for l in listeners.values() {
+			if let Err(e) = insert_bindings(
+				pool,
+				&self.database.publication,
+				&l.claims,
+				std::slice::from_ref(&l.binding),
+				false,
+			)
+			.await
+			{
+				tracing::warn!(tenant = %rt.id, node, error = %e, "a subscription could not be written on a node");
+			}
+		}
+		self.nodes
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.insert(node, pool.clone());
+		drop(listeners);
+		Ok(NodeRegistration {
+			changes: self.clone(),
+			node,
+		})
+	}
+
+	async fn pump(
+		self: &Arc<Self>,
+		rt: &Arc<TenantRt>,
+		conn: &mut Connection,
+		checkers: &mut Vec<tokio_postgres::Client>,
+		database: &Database,
+		follower: Option<cluster::Follower>,
+	) -> Result<(), String> {
+		let scope = Scope {
+			node: None,
+			cluster: follower.is_some(),
+		};
+		self.pump_scoped(rt, conn, checkers, database, scope, follower)
+			.await
+	}
+
+	/// Read one stream and decide what it carries, until it fails or (the home stream) nobody has
+	/// been subscribed for thirty seconds. The home stream holds the follower of a sharded
+	/// project, so the other nodes' streams end with it.
+	async fn pump_scoped(
+		self: &Arc<Self>,
+		rt: &Arc<TenantRt>,
+		conn: &mut Connection,
+		checkers: &mut Vec<tokio_postgres::Client>,
+		database: &Database,
+		mut scope: Scope,
+		mut follower: Option<cluster::Follower>,
+	) -> Result<(), String> {
+		let mut statements = vec![Statements::new()];
 		let mut relations: HashMap<u32, Relation> = HashMap::new();
 		let mut commit_time: i64 = 0;
 		let mut xid: u32 = 0;
+		// The transaction being read was applied by logical replication. In a sharded project that
+		// is Lepis copying rows from one node to another: nobody changed them.
+		let mut replicated = false;
 		let mut idle_since: Option<std::time::Instant> = None;
+		let mut probed = std::time::Instant::now();
 		// Changes read and not decided yet, all to one table and of one kind, and the commit to
 		// acknowledge once they are.
 		let mut batch: Option<Batch> = None;
 		let mut ack: Option<u64> = None;
 		loop {
+			// An unsharded project that has become one: its other nodes are followed from here on.
+			// Only between batches, so nothing read is held up by it.
+			if scope.node.is_none()
+				&& !scope.cluster
+				&& batch.is_none()
+				&& ack.is_none()
+				&& probed.elapsed() > PROBE_EVERY
+			{
+				probed = std::time::Instant::now();
+				if let Some(shape) = cluster::probe(&checkers[0], &rt.id).await {
+					tracing::info!(tenant = %rt.id, nodes = shape.members.len(), "the project is sharded: following its nodes");
+					follower = Some(cluster::follow(self.clone(), rt.clone(), shape).await);
+					scope.cluster = true;
+				}
+			}
 			// While something waits to be decided, take only what has already arrived: when
 			// nothing more is there, decide what has queued. So a lone change goes at once, and
 			// changes that queue while one batch is decided are decided together.
@@ -518,8 +695,16 @@ impl Changes {
 				match futures_util::FutureExt::now_or_never(conn.next()) {
 					Some(e) => e.map_err(|e| e.to_string())?,
 					None => {
-						self.flush(rt, &mut checkers, &mut statements, &relations, &mut batch)
-							.await?;
+						self.flush(
+							rt,
+							checkers,
+							&mut statements,
+							&relations,
+							&mut batch,
+							database,
+							scope,
+						)
+						.await?;
 						if let Some(lsn) = ack.take() {
 							conn.ack(lsn).await.map_err(|e| e.to_string())?;
 						}
@@ -530,16 +715,20 @@ impl Changes {
 				match tokio::time::timeout(Duration::from_secs(5), conn.next()).await {
 					Ok(e) => e.map_err(|e| e.to_string())?,
 					Err(_) => {
-						if self.retired.load(Ordering::SeqCst) {
+						if self.is_retired() {
 							return Ok(());
 						}
-						if self.listeners.lock().await.is_empty() {
-							let since = *idle_since.get_or_insert_with(std::time::Instant::now);
-							if since.elapsed() > Duration::from_secs(30) {
-								return Ok(());
+						// A node's stream lives as long as the home stream's follower keeps it.
+						if scope.node.is_none() {
+							if self.listeners.lock().await.is_empty() {
+								let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+								if since.elapsed() > Duration::from_secs(30) {
+									drop(follower);
+									return Ok(());
+								}
+							} else {
+								idle_since = None;
 							}
-						} else {
-							idle_since = None;
 						}
 						continue;
 					}
@@ -548,8 +737,16 @@ impl Changes {
 			match event {
 				Event::Keepalive { end_lsn, reply } => {
 					if reply {
-						self.flush(rt, &mut checkers, &mut statements, &relations, &mut batch)
-							.await?;
+						self.flush(
+							rt,
+							checkers,
+							&mut statements,
+							&relations,
+							&mut batch,
+							database,
+							scope,
+						)
+						.await?;
 						conn.ack(ack.take().unwrap_or(0).max(end_lsn))
 							.await
 							.map_err(|e| e.to_string())?;
@@ -566,12 +763,21 @@ impl Changes {
 						} => {
 							commit_time = t;
 							xid = x;
+							replicated = false;
 							continue;
 						}
 						Message::Relation(r) => {
 							// A table's shape changed: what was read of it is decided first.
-							self.flush(rt, &mut checkers, &mut statements, &relations, &mut batch)
-								.await?;
+							self.flush(
+								rt,
+								checkers,
+								&mut statements,
+								&relations,
+								&mut batch,
+								database,
+								scope,
+							)
+							.await?;
 							relations.insert(r.id, r);
 							continue;
 						}
@@ -582,6 +788,12 @@ impl Changes {
 							ack = Some(commit_end.max(end_lsn));
 							continue;
 						}
+						// Origin: sent after Begin when the transaction was applied by logical
+						// replication.
+						Message::Other(b'O') => {
+							replicated = true;
+							continue;
+						}
 						Message::Insert { relation, new } => (relation, "INSERT", Some(new), None),
 						Message::Update { relation, old, new } => {
 							(relation, "UPDATE", Some(new), old)
@@ -589,14 +801,31 @@ impl Changes {
 						Message::Delete { relation, old } => (relation, "DELETE", None, Some(old)),
 						Message::Other(_) => continue,
 					};
+					if replicated && scope.cluster {
+						continue;
+					}
 					let Some(r) = relations.get(&relation) else {
 						continue;
 					};
+					// Another node streams its sharded tables only: a reference table is written on
+					// every node at once and is the home stream's to report, and the rest live on
+					// home alone.
+					if scope.node.is_some() && !self.is_sharded(&r.schema, &r.name) {
+						continue;
+					}
 					if batch.as_ref().is_some_and(|b| {
 						b.relation != relation || b.action != action || b.changes.len() >= BATCH
 					}) {
-						self.flush(rt, &mut checkers, &mut statements, &relations, &mut batch)
-							.await?;
+						self.flush(
+							rt,
+							checkers,
+							&mut statements,
+							&relations,
+							&mut batch,
+							database,
+							scope,
+						)
+						.await?;
 					}
 					if !self.wanted(&r.schema, &r.name, action).await {
 						continue;
@@ -621,8 +850,9 @@ impl Changes {
 		}
 	}
 
-	/// Decide a batch of changes in the project's database and send them, in the order they were
-	/// committed. An error is a checker's connection gone.
+	/// Decide a batch of changes in the database they came from and send them, in the order they
+	/// were committed. An error is a checker's connection gone.
+	#[allow(clippy::too_many_arguments)]
 	async fn flush(
 		&self,
 		rt: &TenantRt,
@@ -630,15 +860,38 @@ impl Changes {
 		statements: &mut Vec<Statements>,
 		relations: &HashMap<u32, Relation>,
 		batch: &mut Option<Batch>,
+		database: &Database,
+		scope: Scope,
 	) -> Result<(), String> {
-		let Some(b) = batch.take() else {
+		let Some(mut b) = batch.take() else {
 			return Ok(());
 		};
-		if !relations.contains_key(&b.relation) {
+		let Some(r) = relations.get(&b.relation) else {
 			return Ok(());
+		};
+		// Rows Lepis deleted because this node no longer owns them (the cleanup after a split or a
+		// move): they live on, on their new owner, and nobody deleted them.
+		if scope.cluster && b.action == "DELETE" && self.is_sharded(&r.schema, &r.name) {
+			match cluster::disowned(&checkers[0], r, &b.changes).await {
+				Ok(gone) if !gone.is_empty() => {
+					let mut n = 0;
+					b.changes.retain(|_| {
+						n += 1;
+						!gone.contains(&(n - 1))
+					});
+					if b.changes.is_empty() {
+						return Ok(());
+					}
+				}
+				Ok(_) => {}
+				Err(e) if checkers[0].is_closed() => return Err(e.to_string()),
+				Err(e) => {
+					tracing::warn!(tenant = %rt.id, node = ?scope.node, error = %e, "whether deleted rows were moved could not be told; they are sent")
+				}
+			}
 		}
 		if checkers.len() < CHECKERS && self.listeners.lock().await.len() >= SHARE_FROM {
-			match self.checker().await {
+			match Self::checker(database).await {
 				Ok(c) => {
 					checkers.push(c);
 					statements.push(Statements::new());
@@ -656,7 +909,7 @@ impl Changes {
 			b.relation,
 			b.action,
 			&b.changes,
-			self.database.poll_max_record_bytes as i32,
+			database.poll_max_record_bytes as i32,
 		)
 		.await
 		{
@@ -668,6 +921,7 @@ impl Changes {
 				}
 				tracing::debug!(
 					tenant = %rt.id,
+					node = ?scope.node,
 					changes = b.changes.len(),
 					decide_ms = decided.as_secs_f64() * 1000.0,
 					total_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -699,16 +953,16 @@ impl Changes {
 			.await
 	}
 
-	/// The stream's own connection for deciding changes. The row checks switch its role, so it is
+	/// A stream's own connection for deciding changes. The row checks switch its role, so it is
 	/// never lent to anything else, and they stay prepared on it for as long as it lives.
-	async fn checker(&self) -> Result<tokio_postgres::Client, String> {
+	async fn checker(database: &Database) -> Result<tokio_postgres::Client, String> {
 		let mut config = tokio_postgres::Config::new();
 		config
-			.host(&self.database.host)
-			.port(self.database.port)
-			.dbname(&self.database.name)
-			.user(&self.database.user)
-			.password(&self.database.password)
+			.host(&database.host)
+			.port(database.port)
+			.dbname(&database.name)
+			.user(&database.user)
+			.password(&database.password)
 			.application_name("snout_realtime_checks")
 			.connect_timeout(Duration::from_secs(10));
 		let (client, connection) = config
@@ -753,6 +1007,92 @@ impl Changes {
 			});
 		}
 	}
+}
+
+/// A node `subscribe` writes to, for as long as its stream is open: dropped (the stream ended or
+/// was aborted), the node is forgotten.
+pub(crate) struct NodeRegistration {
+	changes: Arc<Changes>,
+	node: i32,
+}
+
+impl Drop for NodeRegistration {
+	fn drop(&mut self) {
+		self.changes
+			.nodes
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.remove(&self.node);
+	}
+}
+
+/// Write bindings' rows in one database, in one transaction. On the home node (`required`) a
+/// binding that matches no published table is the client's error, in the pinned server's words;
+/// on another node it only means that node does not stream the table.
+async fn insert_bindings(
+	pool: &deadpool_postgres::Pool,
+	publication: &str,
+	claims: &Value,
+	bindings: &[Binding],
+	required: bool,
+) -> Result<(), String> {
+	let mut client = pool
+		.get()
+		.await
+		.map_err(|e| format!("Unable to subscribe to changes: {e}"))?;
+	let t = client.transaction().await.map_err(|e| e.to_string())?;
+	for b in bindings {
+		let filters = Value::Array(
+			b.filters
+				.iter()
+				.map(|(c, o, v)| {
+					Value::Array(vec![c.clone().into(), o.clone().into(), v.clone().into()])
+				})
+				.collect(),
+		);
+		let result = t
+			.query(
+				INSERT_SQL,
+				&[
+					&publication,
+					&b.schema,
+					&b.table,
+					&b.subscription_id.to_string(),
+					claims,
+					&filters,
+					&b.action,
+					&b.selected,
+				],
+			)
+			.await;
+		match result {
+			Ok(rows) if !rows.is_empty() || !required => {}
+			Ok(_) => {
+				return Err(format!(
+					"Unable to subscribe to changes with given parameters. Please check Realtime is enabled for the given connect parameters: [{}]",
+					describe(b)
+				));
+			}
+			Err(e) => {
+				let detail = match e.as_db_error() {
+					Some(db) => format!(
+						"ERROR {} ({}) {}",
+						db.code().code(),
+						condition_name(db.code().code()),
+						db.message()
+					),
+					None => e.to_string(),
+				};
+				return Err(format!(
+					"Unable to subscribe to changes with given parameters. An exception happened so please check your connect parameters: [{}]. Exception: {}",
+					describe(b),
+					detail
+				));
+			}
+		}
+	}
+	t.commit().await.map_err(|e| e.to_string())?;
+	Ok(())
 }
 
 /// Delete a channel's subscription rows. Separate from `Changes::unsubscribe` because a channel

@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod changes;
+pub mod cluster;
 pub mod config;
 pub mod db;
 pub mod hub;

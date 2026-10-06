@@ -33,6 +33,17 @@ every project on a SnoutData Cloud host.
   hour, partitions are made three days ahead and those older than three days are dropped.
 - **Many projects, one process.** A tenant (a project) is registered through an admin API with its
   database and its JWT secret; sockets are routed to it by host name.
+- **Sharded databases.** When the registered database is the home node of a
+  snout-lepis cluster (it has a `lepis` schema), its
+  changes come from every node: one stream per node, all delivering to the same subscribers. The
+  home node streams every published table; each other node streams its sharded tables, so a
+  reference table written on every node is sent once. A subscription is written on every node and
+  a change is checked on the node it came from, by that node's own policies. The node list is
+  followed as it changes (`LISTEN lepis_epoch`). Rows Lepis copies between nodes (they arrive by
+  logical replication) and rows it deletes from a node that no longer owns them (they fail that
+  node's `lepis_owns` fence) are not sent, since nobody changed them. Changes from different
+  nodes are not ordered against each other; each node's are in its commit order. See
+  "Sharded databases" below for what the role needs.
 - **Small.** A 3 MB image built `FROM scratch`, under 1 MB of memory at idle, ready in about
   0.15 s. On a 2-CPU arm64 machine, 1,000 subscribers of one table, each a different user under
   a row-level security policy, used 33 MB; broadcast to 90 subscribers at 20 a second, 3 MB.
@@ -106,11 +117,43 @@ gateway that maps `/realtime/v1` to `/socket` reaches them with no route of its 
   next connection when `migrations/0002_changes.sql` has changed (its hash is in
   `snout_realtime.migrations`); the `realtime` tables are created once and not altered.
 
+## Sharded databases
+
+The tenant is registered with the home node, as for any database; nothing else is configured.
+The login it connects with is used on every node (snout-lepis gives every node the same roles
+with the same password verifiers), and reaches each at its `peer_host` label, or its `host` when
+it has none. On the home node that role needs to read the catalog:
+
+```sql
+grant usage on schema lepis to <role>;
+grant select on lepis.cluster, lepis.node, lepis.relation to <role>;
+grant insert, update on lepis.router to <role>;   -- optional, see below
+```
+
+Without the first two the project is streamed from its home node alone, with a warning in the log.
+The third lets the server acknowledge each catalog epoch in `lepis.router` once the new nodes'
+streams are open, so a cutover onto a brand-new node waits for them and no change on it is missed;
+without it the server logs that it is not acknowledging, once.
+
+On each other node it prepares its schema, as on any project's first connection, and makes that
+node's copy of the publication hold the sharded tables the home node's does (the rights `alter
+publication` needs there: the publication's and the tables' owner, or a superuser). When it cannot,
+it logs the statement to run there, once. A row-level security policy on a sharded table runs on
+the node that holds the row, so it may read that node's own tables, reference tables and functions,
+and not a table that lives on the home node alone.
+
+What the server streams in a sharded project, beyond the home node's stream: nothing while nobody
+is subscribed; one probe of `pg_namespace` when a project's stream opens and every 30 s while it is
+open, so a project sharded with subscribers connected is followed onto its nodes. Changes made on a
+node in the moment it is being promoted (a physical split) can be missed when the acknowledgement
+above is not granted.
+
 ## Development
 
 `bash scripts/test.sh` runs the checks in a container; Docker or Podman is the only thing you
 need. `bash tests/db.sh` runs the same suite against a throwaway Postgres 17, database tests
-included: who sees each change, and what of it.
+included: who sees each change, and what of it. `bash tests/cluster.sh [18|13]` runs a sharded
+project's streams against three throwaway Postgres servers.
 
 ## Licence
 
