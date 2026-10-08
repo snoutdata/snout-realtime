@@ -59,6 +59,82 @@ fn can_read_presence(private: bool, policies: &Policies) -> bool {
 	!private || policies.presence_read == Some(true)
 }
 
+/// Whether a join asks for presence. `config.presence.enabled` decides when it is there; a
+/// `presence` object WITHOUT it (an older realtime-js, or a client written by hand to the wire
+/// protocol) is taken as asking, so the members already on the topic are sent on join rather
+/// than only after the first `track`. Current realtime-js always sends `enabled` (D19).
+fn presence_asked(config: &Value) -> bool {
+	match config.get("presence") {
+		Some(Value::Object(p)) => p.get("enabled").is_none_or(|e| e.as_bool() == Some(true)),
+		_ => false,
+	}
+}
+
+/// The ref a channel is known by. V1 has no `join_ref` slot, so a V1 client written by hand
+/// sends none, and its join's own `ref` stands in (realtime-js sends both, and they are equal).
+/// The server's `phx_close` and `system` carry it, which is how a client tells a close for a
+/// channel it already replaced from a close for the replacement.
+fn channel_join_ref(vsn: Vsn, m: &Inbound) -> Option<String> {
+	match vsn {
+		Vsn::V1 => m.join_ref.clone().or_else(|| m.reference.clone()),
+		Vsn::V2 => m.join_ref.clone(),
+	}
+}
+
+/// A `system` message on a channel. V2 carries the join ref in its own slot; V1 has only `ref`,
+/// so it rides there.
+fn system_frame(vsn: Vsn, topic: &str, join_ref: &Option<String>, payload: Value) -> Frame {
+	let reference = match vsn {
+		Vsn::V1 => join_ref.clone(),
+		Vsn::V2 => None,
+	};
+	protocol::message(vsn, join_ref, &reference, topic, "system", payload)
+}
+
+/// How many server-closed topics a socket remembers the reason for.
+const CLOSED_REMEMBERED: usize = 64;
+
+/// The topics the server closed on this socket, and why, so a message that arrives on one after
+/// the close is told why it has no channel, not just that it has none. Bounded: the oldest is
+/// forgotten first. A topic is forgotten when it is joined or left again.
+#[derive(Default)]
+struct Closed(std::collections::VecDeque<(String, String)>);
+
+impl Closed {
+	fn remember(&mut self, topic: &str, reason: &str) {
+		self.forget(topic);
+		if self.0.len() >= CLOSED_REMEMBERED {
+			self.0.pop_front();
+		}
+		self.0.push_back((topic.to_string(), reason.to_string()));
+	}
+
+	fn forget(&mut self, topic: &str) {
+		self.0.retain(|(t, _)| t != topic);
+	}
+
+	fn why(&self, topic: &str) -> Option<&str> {
+		self.0
+			.iter()
+			.find(|(t, _)| t == topic)
+			.map(|(_, r)| r.as_str())
+	}
+}
+
+/// The reply to a message on a topic this socket has no channel for. `reason` stays the string
+/// Phoenix sends; a topic the server closed also says why, since a client flooding a closed
+/// channel is otherwise sent one bare `unmatched topic` per message with nothing tying them to the
+/// `system` message that explained the close.
+fn unmatched(closed: Option<&str>) -> Value {
+	match closed {
+		Some(why) => json!({
+			"reason": "unmatched topic",
+			"message": format!("channel closed by the server: {why}. Join it again, or open a new socket."),
+		}),
+		None => json!({ "reason": "unmatched topic" }),
+	}
+}
+
 /// Whether a channel is sent a hub broadcast of `event`.
 fn may_receive(private: bool, policies: &Policies, event: &str) -> bool {
 	event != "presence_diff" || can_read_presence(private, policies)
@@ -111,6 +187,8 @@ struct Socket {
 	headers: Map<String, Value>,
 	tx: Outbox,
 	channels: HashMap<String, Channel>,
+	/// Topics the server closed, and why.
+	closed: Closed,
 	/// Frames waiting to go out.
 	out: Vec<Frame>,
 }
@@ -133,6 +211,7 @@ pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 		headers: accepted.headers,
 		tx,
 		channels: HashMap::new(),
+		closed: Closed::default(),
 		out: Vec::new(),
 	};
 	let (mut sink, mut stream) = ws.split();
@@ -288,7 +367,7 @@ impl Socket {
 		name: &str,
 	) {
 		let payload = json!({ "message": message, "status": status, "extension": extension, "channel": name });
-		let f = protocol::message(self.vsn, join_ref, &None, topic, "system", payload);
+		let f = system_frame(self.vsn, topic, join_ref, payload);
 		self.push(f);
 	}
 
@@ -305,6 +384,7 @@ impl Socket {
 		match m.event.as_str() {
 			"phx_join" => self.join(m).await,
 			"phx_leave" => {
+				self.closed.forget(&m.topic);
 				if let Some(ch) = self.channels.remove(&m.topic) {
 					self.rt.log.push(
 						Event::new(Kind::Leave)
@@ -312,16 +392,18 @@ impl Socket {
 							.channel(&ch.name)
 							.presence_key(&ch.presence_key),
 					);
+					// The leave's own join ref, or the channel's when it sent none (V1 by hand).
+					let join_ref = m.join_ref.clone().or_else(|| ch.join_ref.clone());
 					self.cleanup(ch).await;
 					self.reply(&m, "ok", json!({}));
-					let join_ref = m.join_ref.clone();
 					self.close_frame(&m.topic.clone(), &join_ref);
 				} else {
 					self.reply(&m, "ok", json!({}));
 				}
 			}
 			_ if !self.channels.contains_key(&m.topic) => {
-				self.reply(&m, "error", json!({ "reason": "unmatched topic" }));
+				let response = unmatched(self.closed.why(&m.topic));
+				self.reply(&m, "error", response);
 			}
 			"broadcast" => self.broadcast(m).await,
 			"presence" => self.presence(m).await,
@@ -333,9 +415,18 @@ impl Socket {
 	// --- join -----------------------------------------------------------------------------
 
 	async fn join(&mut self, m: Inbound) {
+		self.closed.forget(&m.topic);
 		if let Some(old) = self.channels.remove(&m.topic) {
-			// A second join on a joined topic replaces the first, as Phoenix does.
+			// A second join on a joined topic replaces the first, as Phoenix does. Logged, since a
+			// client rejoining in a loop is otherwise a run of joins with nothing between them.
 			let old_ref = old.join_ref.clone();
+			self.rt.log.push(
+				Event::new(Kind::ChannelClosed)
+					.socket(self.id)
+					.channel(&old.name)
+					.presence_key(&old.presence_key)
+					.reason("replaced by a new join on the same topic"),
+			);
 			self.cleanup(old).await;
 			self.close_frame(&m.topic.clone(), &old_ref);
 		}
@@ -407,11 +498,7 @@ impl Socket {
 			.and_then(Value::as_bool)
 			.unwrap_or(false);
 		let tenant = self.rt.tenant();
-		let presence_enabled = config
-			.pointer("/presence/enabled")
-			.and_then(Value::as_bool)
-			.unwrap_or(false)
-			|| tenant.presence_enabled;
+		let presence_enabled = presence_asked(&config) || tenant.presence_enabled;
 
 		let access_token = match params
 			.get("access_token")
@@ -558,12 +645,10 @@ impl Socket {
 			}
 		}
 		if let Some(e) = parse_error {
-			after.push(protocol::message(
+			after.push(system_frame(
 				self.vsn,
-				&m.join_ref,
-				&None,
 				&m.topic,
-				"system",
+				&channel_join_ref(self.vsn, m),
 				json!({ "message": e, "status": "error", "extension": "postgres_changes", "channel": name }),
 			));
 			parsed.clear();
@@ -594,7 +679,7 @@ impl Socket {
 		let confirm_at = Instant::now()
 			+ Duration::from_secs((exp - now_secs()).max(0) as u64).min(CONFIRM_TOKEN_EVERY);
 		let channel = Channel {
-			join_ref: m.join_ref.clone(),
+			join_ref: channel_join_ref(self.vsn, m),
 			name: name.to_string(),
 			key,
 			sub,
@@ -765,6 +850,7 @@ impl Socket {
 					.reason(message),
 			);
 			self.cleanup(ch).await;
+			self.closed.remember(topic, message);
 			self.system(topic, &join_ref, "system", "error", message, &name);
 			self.close_frame(topic, &join_ref);
 		}
@@ -1320,5 +1406,142 @@ mod tests {
 		assert!(may_receive(true, &refused, "broadcast"));
 		// A public channel has no policies to consult.
 		assert!(may_receive(false, &Policies::default(), "presence_diff"));
+	}
+
+	fn join(join_ref: Option<&str>, reference: Option<&str>) -> Inbound {
+		Inbound {
+			join_ref: join_ref.map(str::to_string),
+			reference: reference.map(str::to_string),
+			topic: "realtime:room".into(),
+			event: "phx_join".into(),
+			payload: InboundPayload::Json(json!({})),
+		}
+	}
+
+	fn text(f: Frame) -> Value {
+		match f {
+			Frame::Text(t) => serde_json::from_str(&t).unwrap(),
+			Frame::Binary(_) => panic!("a text frame was expected"),
+		}
+	}
+
+	#[test]
+	fn a_v1_join_without_a_join_ref_is_known_by_its_ref() {
+		// A hand-written V1 client sends no join_ref: its join's ref stands in.
+		assert_eq!(
+			channel_join_ref(Vsn::V1, &join(None, Some("6"))).as_deref(),
+			Some("6")
+		);
+		// realtime-js sends both, equal; a join_ref that is sent is kept.
+		assert_eq!(
+			channel_join_ref(Vsn::V1, &join(Some("6"), Some("6"))).as_deref(),
+			Some("6")
+		);
+		// V2 has its own slot, and is left as the client sent it.
+		assert_eq!(channel_join_ref(Vsn::V2, &join(None, Some("6"))), None);
+		assert_eq!(
+			channel_join_ref(Vsn::V2, &join(Some("3"), Some("6"))).as_deref(),
+			Some("3")
+		);
+	}
+
+	#[test]
+	fn a_server_close_and_system_message_carry_the_join_ref() {
+		let jr = Some("6".to_string());
+		// V1: in `ref`, the only slot it has.
+		let close = text(protocol::message(
+			Vsn::V1,
+			&jr,
+			&jr,
+			"realtime:room",
+			"phx_close",
+			json!({}),
+		));
+		assert_eq!(close["ref"], json!("6"));
+		let system = text(system_frame(
+			Vsn::V1,
+			"realtime:room",
+			&jr,
+			json!({ "status": "error" }),
+		));
+		assert_eq!(system["event"], json!("system"));
+		assert_eq!(system["ref"], json!("6"));
+		// V2: in the join_ref slot, with `ref` null, as before.
+		let system = text(system_frame(Vsn::V2, "realtime:room", &jr, json!({})));
+		assert_eq!(system[0], json!("6"));
+		assert_eq!(system[1], Value::Null);
+		// Nothing else changes shape: presence_state in V1 still has a null ref.
+		let state = text(protocol::message(
+			Vsn::V1,
+			&jr,
+			&None,
+			"realtime:room",
+			"presence_state",
+			json!({}),
+		));
+		assert_eq!(state["ref"], Value::Null);
+	}
+
+	#[test]
+	fn presence_is_asked_for_by_enabled_or_by_a_presence_object_without_it() {
+		assert!(presence_asked(
+			&json!({ "presence": { "key": "a", "enabled": true } })
+		));
+		assert!(!presence_asked(
+			&json!({ "presence": { "key": "a", "enabled": false } })
+		));
+		// No `enabled` at all: an older or hand-written client, taken as asking.
+		assert!(presence_asked(&json!({ "presence": { "key": "a" } })));
+		assert!(presence_asked(&json!({ "presence": {} })));
+		assert!(!presence_asked(&json!({ "broadcast": { "self": true } })));
+		assert!(!presence_asked(&Value::Null));
+		assert!(!presence_asked(
+			&json!({ "presence": { "key": "a", "enabled": null } })
+		));
+	}
+
+	#[test]
+	fn a_message_on_a_topic_the_server_closed_is_told_why() {
+		let mut closed = Closed::default();
+		closed.remember("realtime:room", "Too many messages per second");
+		let reply = unmatched(closed.why("realtime:room"));
+		assert_eq!(reply["reason"], json!("unmatched topic"));
+		assert_eq!(
+			reply["message"],
+			json!(
+				"channel closed by the server: Too many messages per second. Join it again, or open a new socket."
+			)
+		);
+		// A topic never joined is answered as Phoenix answers it.
+		assert_eq!(
+			unmatched(closed.why("realtime:other")),
+			json!({ "reason": "unmatched topic" })
+		);
+		// Joined (or left) again: forgotten.
+		closed.forget("realtime:room");
+		assert_eq!(closed.why("realtime:room"), None);
+	}
+
+	#[test]
+	fn the_closed_topics_a_socket_remembers_are_bounded() {
+		let mut closed = Closed::default();
+		for i in 0..CLOSED_REMEMBERED + 10 {
+			closed.remember(&format!("realtime:{i}"), "why");
+		}
+		assert_eq!(closed.0.len(), CLOSED_REMEMBERED);
+		// The oldest went first.
+		assert_eq!(closed.why("realtime:0"), None);
+		assert_eq!(
+			closed.why(&format!("realtime:{}", CLOSED_REMEMBERED + 9)),
+			Some("why")
+		);
+		// A topic closed twice is remembered once, with the newer reason.
+		closed.remember("realtime:x", "first");
+		closed.remember("realtime:x", "second");
+		assert_eq!(
+			closed.0.iter().filter(|(t, _)| t == "realtime:x").count(),
+			1
+		);
+		assert_eq!(closed.why("realtime:x"), Some("second"));
 	}
 }
