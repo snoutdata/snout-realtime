@@ -13,9 +13,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use snout_realtime::changes::{self, Binding, Changes};
-use snout_realtime::hub::{Hub, Out};
+use snout_realtime::hub::{self, Hub, Inbox, Out};
 use snout_realtime::tenants::{Database, Tenant};
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
@@ -128,7 +127,7 @@ fn claims(sub: &str) -> serde_json::Map<String, Value> {
 }
 
 /// The next change a channel is sent, as `{type, table, record, old_record}`.
-async fn next(rx: &mut UnboundedReceiver<Out>) -> Option<Value> {
+async fn next(rx: &mut Inbox) -> Option<Value> {
 	loop {
 		match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
 			Ok(Some(Out::Changes { data, .. })) => return serde_json::from_str(&data).ok(),
@@ -147,7 +146,7 @@ fn field(change: &Value, part: &str, column: &str) -> String {
 }
 
 /// Nothing more for this channel within a moment.
-async fn quiet(rx: &mut UnboundedReceiver<Out>) -> bool {
+async fn quiet(rx: &mut Inbox) -> bool {
 	loop {
 		match tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await {
 			Ok(Some(Out::Changes { .. })) => return false,
@@ -239,9 +238,9 @@ async fn a_sharded_projects_changes_come_from_every_node() {
 	let changes = Changes::new(database.clone());
 
 	// U1 and U2 on the sharded table, U1 on the reference and the global tables.
-	let (tx1, mut rx1) = unbounded_channel();
-	let (tx2, mut rx2) = unbounded_channel();
-	let (tx3, mut rx3) = unbounded_channel();
+	let (tx1, mut rx1) = hub::outbox();
+	let (tx2, mut rx2) = hub::outbox();
+	let (tx3, mut rx3) = hub::outbox();
 	let orders1 = vec![binding("orders", "*")];
 	let orders2 = vec![binding("orders", "INSERT")];
 	let others = vec![binding("countries", "*"), binding("notes", "*")];
@@ -457,7 +456,7 @@ async fn an_unsharded_project_is_streamed_as_before() {
 	let pool = snout_realtime::db::new_pool(&database, 4).unwrap();
 	snout_realtime::db::prepare(&pool).await.unwrap();
 	let changes = Changes::new(database);
-	let (tx, mut rx) = unbounded_channel();
+	let (tx, mut rx) = hub::outbox();
 	changes
 		.subscribe(
 			rt,
