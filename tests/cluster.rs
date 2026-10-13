@@ -49,22 +49,22 @@ insert into lepis.relation values ('public', 'orders', 'sharded', 'tenants', 'te
 fn node_sql(owns: i32) -> String {
 	format!(
 		"do $$ begin
-		   if to_regrole('snout_app') is null then create role snout_app nologin noinherit; end if;
-		   if to_regrole('snout_member') is null then create role snout_member nologin noinherit; end if;
-		   if to_regrole('snout_server') is null then create role snout_server nologin noinherit bypassrls; end if;
+		   if to_regrole('anon') is null then create role anon nologin noinherit; end if;
+		   if to_regrole('authenticated') is null then create role authenticated nologin noinherit; end if;
+		   if to_regrole('service_role') is null then create role service_role nologin noinherit bypassrls; end if;
 		 end $$;
-		 create schema snout_identity;
-		 create function snout_identity.user_id() returns uuid language sql stable as
+		 create schema auth;
+		 create function auth.uid() returns uuid language sql stable as
 		   $$ select nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid $$;
-		 grant usage on schema snout_identity, public to snout_app, snout_member;
+		 grant usage on schema auth, public to anon, authenticated;
 		 create table public.orders (tenant int not null, id bigint not null, owner uuid, note text,
 		   primary key (tenant, id));
 		 alter table public.orders enable row level security;
-		 create policy mine on public.orders for select to snout_member using (owner = snout_identity.user_id());
-		 grant select on public.orders to snout_member;
+		 create policy mine on public.orders for select to authenticated using (owner = auth.uid());
+		 grant select on public.orders to authenticated;
 		 alter table public.orders add constraint lepis_owns check (tenant % 3 = {owns}) not valid;
 		 create table public.countries (code text primary key, name text);
-		 grant select on public.countries to snout_member;"
+		 grant select on public.countries to authenticated;"
 	)
 }
 
@@ -120,7 +120,7 @@ fn binding(table: &str, event: &str) -> Binding {
 }
 
 fn claims(sub: &str) -> serde_json::Map<String, Value> {
-	json!({ "role": "snout_member", "sub": sub })
+	json!({ "role": "authenticated", "sub": sub })
 		.as_object()
 		.unwrap()
 		.clone()
@@ -157,7 +157,7 @@ async fn quiet(rx: &mut Inbox) -> bool {
 }
 
 async fn rows(c: &Client) -> i64 {
-	c.query_one("select count(*) from snout_live.listeners", &[])
+	c.query_one("select count(*) from realtime.subscription", &[])
 		.await
 		.unwrap()
 		.get(0)
@@ -189,7 +189,7 @@ async fn a_sharded_projects_changes_come_from_every_node() {
 	}
 	home.batch_execute(
 		"create table public.notes (id int primary key, body text);
-		 grant select on public.notes to snout_member;
+		 grant select on public.notes to authenticated;
 		 create publication snoutdata_realtime for table public.orders, public.countries, public.notes;",
 	)
 	.await
@@ -245,15 +245,15 @@ async fn a_sharded_projects_changes_come_from_every_node() {
 	let orders2 = vec![binding("orders", "INSERT")];
 	let others = vec![binding("countries", "*"), binding("notes", "*")];
 	changes
-		.subscribe(rt.clone(), &pool, &claims(U1), &orders1, tx1, "live:o1")
+		.subscribe(rt.clone(), &pool, &claims(U1), &orders1, tx1, "realtime:o1")
 		.await
 		.unwrap();
 	changes
-		.subscribe(rt.clone(), &pool, &claims(U2), &orders2, tx2, "live:o2")
+		.subscribe(rt.clone(), &pool, &claims(U2), &orders2, tx2, "realtime:o2")
 		.await
 		.unwrap();
 	changes
-		.subscribe(rt.clone(), &pool, &claims(U1), &others, tx3, "live:x")
+		.subscribe(rt.clone(), &pool, &claims(U1), &others, tx3, "realtime:x")
 		.await
 		.unwrap();
 	assert_eq!(changes.shape().map(|s| s.members.len()), Some(2));
@@ -464,7 +464,7 @@ async fn an_unsharded_project_is_streamed_as_before() {
 			&claims(U1),
 			&[binding("orders", "*")],
 			tx,
-			"live:o",
+			"realtime:o",
 		)
 		.await
 		.unwrap();

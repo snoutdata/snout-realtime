@@ -69,7 +69,7 @@ end
 $body$;
 
 -- Does a filter hold for a value, both read as the column's type?
-create or replace function snout_realtime.filter_holds(op snout_live.equality_op, type_text text, value text, operand text) returns boolean
+create or replace function snout_realtime.filter_holds(op realtime.equality_op, type_text text, value text, operand text) returns boolean
 	language plpgsql immutable
 	as $body$
 declare
@@ -171,7 +171,7 @@ begin
 	end loop;
 
 	for role_ in
-		select s.claims_role from snout_live.listeners s
+		select s.claims_role from realtime.subscription s
 		where s.entity = entity_ and (s.action_filter = '*' or s.action_filter = action)
 		group by s.claims_role
 		order by s.claims_role::text
@@ -181,7 +181,7 @@ begin
 		-- checked.
 		if action <> 'DELETE' and exists (select 1 from unnest(pk) c where not pg_catalog.has_column_privilege(role_, entity_, c, 'SELECT')) then
 			return query select 'send', gs.i, null::integer, null::text, null::text,
-					(select array_agg(s.subscription_id) from snout_live.listeners s
+					(select array_agg(s.subscription_id) from realtime.subscription s
 						where s.entity = entity_ and s.claims_role = role_ and (s.action_filter = '*' or s.action_filter = action)),
 					head, array['Error 401: Unauthorized'], null::text, null::jsonb, null::integer[]
 				from generate_series(1, n) gs(i);
@@ -189,7 +189,7 @@ begin
 		end if;
 		if action <> 'DELETE' and cardinality(eligible) < n then
 			return query select 'send', gs.i, null::integer, null::text, null::text,
-					(select array_agg(s.subscription_id) from snout_live.listeners s
+					(select array_agg(s.subscription_id) from realtime.subscription s
 						where s.entity = entity_ and s.claims_role = role_ and (s.action_filter = '*' or s.action_filter = action)),
 					head, array['Error 400: Bad Request, no primary key'], null::text, null::jsonb, null::integer[]
 				from generate_series(1, n) gs(i)
@@ -202,7 +202,7 @@ begin
 		-- Subscribers without filters see every eligible change, as a set.
 		return query select 'all', null::integer, null::integer, rolname_, null::text, array_agg(s.subscription_id),
 				null::jsonb, null::text[], null::text, null::jsonb, eligible
-			from snout_live.listeners s
+			from realtime.subscription s
 			where s.entity = entity_ and s.claims_role = role_ and (s.action_filter = '*' or s.action_filter = action)
 			  and coalesce(cardinality(s.filters), 0) = 0
 			  and (not rls or action = 'DELETE')
@@ -211,7 +211,7 @@ begin
 		-- Filters: each subscriber that has some, against every change, in a subtransaction of
 		-- its own.
 		for sub in
-			select s.subscription_id, s.filters from snout_live.listeners s
+			select s.subscription_id, s.filters from realtime.subscription s
 			where s.entity = entity_ and s.claims_role = role_ and (s.action_filter = '*' or s.action_filter = action)
 			  and coalesce(cardinality(s.filters), 0) > 0
 		loop
@@ -239,7 +239,7 @@ begin
 		end loop;
 		roles_on := roles_on || role_;
 		any_candidate := any_candidate or exists (
-			select 1 from snout_live.listeners s
+			select 1 from realtime.subscription s
 			where s.entity = entity_ and s.claims_role = role_ and (s.action_filter = '*' or s.action_filter = action)
 			  and coalesce(cardinality(s.filters), 0) = 0);
 
@@ -248,7 +248,7 @@ begin
 			checked := true;
 			return query select 'check', null::integer, null::integer, rolname_, s.claims::text, array_agg(s.subscription_id),
 					null::jsonb, null::text[], null::text, null::jsonb, null::integer[]
-				from snout_live.listeners s
+				from realtime.subscription s
 				where s.entity = entity_ and s.claims_role = role_ and (s.action_filter = '*' or s.action_filter = action)
 				  and (coalesce(cardinality(s.filters), 0) = 0 or s.subscription_id = any (passed))
 				group by s.claims;
@@ -276,7 +276,7 @@ begin
 	for g in
 		select row_number() over (order by s.claims_role::text, s.selected_columns nulls first)::integer as no,
 			s.claims_role as role_, s.selected_columns as group_columns, array_agg(s.subscription_id) as ids
-		from snout_live.listeners s
+		from realtime.subscription s
 		where s.entity = entity_ and (s.action_filter = '*' or s.action_filter = action) and s.claims_role = any (roles_on)
 		  and (coalesce(cardinality(s.filters), 0) = 0 or s.subscription_id = any (passed))
 		group by s.claims_role, s.selected_columns

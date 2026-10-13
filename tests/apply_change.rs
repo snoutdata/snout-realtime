@@ -24,9 +24,9 @@ async fn database() -> Option<Client> {
 	admin
 		.batch_execute(
 			"DO $$ BEGIN
-			   IF to_regrole('snout_app') IS NULL THEN CREATE ROLE snout_app NOLOGIN NOINHERIT; END IF;
-			   IF to_regrole('snout_member') IS NULL THEN CREATE ROLE snout_member NOLOGIN NOINHERIT; END IF;
-			   IF to_regrole('snout_server') IS NULL THEN CREATE ROLE snout_server NOLOGIN NOINHERIT BYPASSRLS; END IF;
+			   IF to_regrole('anon') IS NULL THEN CREATE ROLE anon NOLOGIN NOINHERIT; END IF;
+			   IF to_regrole('authenticated') IS NULL THEN CREATE ROLE authenticated NOLOGIN NOINHERIT; END IF;
+			   IF to_regrole('service_role') IS NULL THEN CREATE ROLE service_role NOLOGIN NOINHERIT BYPASSRLS; END IF;
 			 END $$;",
 		)
 		.await
@@ -43,12 +43,12 @@ async fn database() -> Option<Client> {
 	SECOND.with(|s| *s.borrow_mut() = Some(second));
 	client
 		.batch_execute(
-			"create schema snout_identity;
-			 create function snout_identity.user_id() returns uuid language sql stable as
+			"create schema auth;
+			 create function auth.uid() returns uuid language sql stable as
 			   $$ select nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid $$;
-			 create function snout_identity.claims() returns jsonb language sql stable as
+			 create function auth.jwt() returns jsonb language sql stable as
 			   $$ select current_setting('request.jwt.claims', true)::jsonb $$;
-			 grant usage on schema snout_identity, public to snout_app, snout_member;",
+			 grant usage on schema auth, public to anon, authenticated;",
 		)
 		.await
 		.unwrap();
@@ -58,23 +58,23 @@ async fn database() -> Option<Client> {
 		.batch_execute(
 			"create table public.items (id bigint generated always as identity primary key, owner uuid, room text, title text);
 			 alter table public.items enable row level security;
-			 create policy r on public.items for select to snout_member using (owner = snout_identity.user_id() or room = 'public');
-			 grant select on public.items to snout_app, snout_member;
+			 create policy r on public.items for select to authenticated using (owner = auth.uid() or room = 'public');
+			 grant select on public.items to anon, authenticated;
 			 create table public.nano (id char(21) primary key, v text);
-			 grant select on public.nano to snout_member;
+			 grant select on public.nano to authenticated;
 			 create table public.secret (id bigint generated always as identity primary key, visible text, hidden text);
-			 grant select (id, visible) on public.secret to snout_member;
+			 grant select (id, visible) on public.secret to authenticated;
 			 create table public.poison (id bigint generated always as identity primary key, v text);
 			 alter table public.poison enable row level security;
-			 create policy p on public.poison for select to snout_member
-			   using (nullif(snout_identity.claims() -> 'server_data' ->> 'org', '')::uuid is not null);
-			 grant select on public.poison to snout_member;
+			 create policy p on public.poison for select to authenticated
+			   using (nullif(auth.jwt() -> 'app_metadata' ->> 'org', '')::uuid is not null);
+			 grant select on public.poison to authenticated;
 			 insert into public.items (owner, room, title) values ('00000000-0000-4000-8000-000000000001', 'crud', 'first');
 			 insert into public.nano values ('abc', 'x');
 			 insert into public.secret (visible, hidden) values ('seen', 'HIDDEN');
 			 insert into public.poison (v) values ('p');
 			 create table public.typed (id bigint primary key, doc json, bin bytea, tags text[], at timestamptz);
-			 grant select on public.typed to snout_member;",
+			 grant select on public.typed to authenticated;",
 		)
 		.await
 		.unwrap();
@@ -90,12 +90,12 @@ async fn subscribe(
 	action: &str,
 ) {
 	let filters = match filter {
-		Some((c, o, v)) => format!("array[row('{c}','{o}','{v}')::snout_live.user_defined_filter]"),
+		Some((c, o, v)) => format!("array[row('{c}','{o}','{v}')::realtime.user_defined_filter]"),
 		None => "'{}'".into(),
 	};
 	db.execute(
 		&format!(
-			"insert into snout_live.listeners (subscription_id, entity, filters, claims, action_filter)
+			"insert into realtime.subscription (subscription_id, entity, filters, claims, action_filter)
 			 values ($1::text::uuid, '{table}'::regclass, {filters}, $2, $3)"
 		),
 		&[&id, &claims, &action],
@@ -184,7 +184,7 @@ async fn apply(
 }
 
 fn user(sub: &str) -> serde_json::Value {
-	serde_json::json!({ "role": "snout_member", "sub": sub })
+	serde_json::json!({ "role": "authenticated", "sub": sub })
 }
 
 #[tokio::test]
@@ -213,7 +213,7 @@ async fn who_sees_a_change_and_what_of_it() {
 		a4,
 		"public.items",
 		None,
-		serde_json::json!({ "role": "snout_app" }),
+		serde_json::json!({ "role": "anon" }),
 		"*",
 	)
 	.await;
@@ -294,8 +294,8 @@ async fn who_sees_a_change_and_what_of_it() {
 	// A policy that raises for one subscriber costs that subscriber alone.
 	let d1 = "00000000-0000-4000-8000-0000000000d1";
 	let d2 = "00000000-0000-4000-8000-0000000000d2";
-	subscribe(&db, d1, "public.poison", None, serde_json::json!({ "role": "snout_member", "sub": U1, "server_data": { "org": "not-a-uuid" } }), "*").await;
-	subscribe(&db, d2, "public.poison", None, serde_json::json!({ "role": "snout_member", "sub": U2, "server_data": { "org": "11111111-1111-4111-8111-111111111111" } }), "*").await;
+	subscribe(&db, d1, "public.poison", None, serde_json::json!({ "role": "authenticated", "sub": U1, "app_metadata": { "org": "not-a-uuid" } }), "*").await;
+	subscribe(&db, d2, "public.poison", None, serde_json::json!({ "role": "authenticated", "sub": U2, "app_metadata": { "org": "11111111-1111-4111-8111-111111111111" } }), "*").await;
 	let got = apply(
 		&db,
 		"public.poison",

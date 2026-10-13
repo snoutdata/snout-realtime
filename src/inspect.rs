@@ -7,8 +7,8 @@
 //! and per project: a restart forgets it, and it is never a substitute for the client's own
 //! view, only the server's side of the same story.
 //!
-//! Served at `GET /socket/inspect` and `GET /socket/events` (so `/v1/live/inspect` and
-//! `/v1/live/events` through the front door), to the project's server key only.
+//! Served at `GET /socket/inspect` and `GET /socket/events` (so `/realtime/v1/inspect` and
+//! `/realtime/v1/events` through the front door), to the project's `service_role` key only.
 
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,6 +46,8 @@ pub enum Kind {
 	ChannelClosed,
 	/// A socket ended, with how.
 	Disconnect,
+	/// A realtime handler did not complete: which event, which function, and why.
+	HandlerFailed,
 }
 
 /// One entry in the log.

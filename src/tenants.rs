@@ -124,7 +124,7 @@ impl Tenant {
 			"max_payload_size_in_kb": self.max_payload_size_in_kb,
 			"private_only": self.private_only,
 			"presence_enabled": self.presence_enabled,
-			"changes": self.database.is_some(),
+			"postgres_changes": self.database.is_some(),
 		})
 	}
 }

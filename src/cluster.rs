@@ -9,7 +9,7 @@
 //!  - Every other node has its own, for its SHARDED tables only. A reference table is written on
 //!    every node at once (two-phase commit) and only home's copy is streamed; a global table is on
 //!    home alone.
-//!  - A subscription's rows (`snout_live.listeners`) are written on every node, and a change is
+//!  - A subscription's rows (`realtime.subscription`) are written on every node, and a change is
 //!    decided on the node it came from, as the subscriber, by that node's copy of the table's
 //!    policies. Authorisation is unchanged: the same check, in the database the row is in.
 //!  - The node list is followed: `LISTEN lepis_epoch` on home, read again on each notification

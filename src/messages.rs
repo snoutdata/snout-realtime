@@ -1,10 +1,10 @@
-//! Broadcast from the database: a row written to `snout_live.signals` (by `snout_live.signal()`, or
+//! Broadcast from the database: a row written to `realtime.messages` (by `realtime.send()`, or
 //! by a customer's own trigger) is broadcast to the topic it names.
 //!
 //! Streamed, not polled: a logical replication connection with pgoutput, on a publication of
-//! snout_live.signals alone, through a TEMPORARY slot that lives only as long as the connection,
+//! realtime.messages alone, through a TEMPORARY slot that lives only as long as the connection,
 //! so a process that dies holds no WAL. The publication publishes via the partitioned root, so
-//! a row from any day's partition arrives as snout_live.signals.
+//! a row from any day's partition arrives as realtime.messages.
 //!
 //! The publication and slot carry our own names (the pinned server's are its own); a project
 //! switched back to it makes its own.
@@ -46,7 +46,7 @@ async fn ensure_publication(pool: &deadpool_postgres::Pool) -> Result<(), String
 	let sql = format!(
 		"do $$ begin
 			if not exists (select 1 from pg_publication where pubname = '{PUBLICATION}') then
-				create publication {pub} for table snout_live.signals with (publish_via_partition_root = true);
+				create publication {pub} for table realtime.messages with (publish_via_partition_root = true);
 			end if;
 		end $$",
 		pub = quote_ident(PUBLICATION)

@@ -10,6 +10,8 @@ pub mod changes;
 pub mod cluster;
 pub mod config;
 pub mod db;
+pub mod engineio;
+pub mod handlers;
 pub mod hub;
 pub mod inspect;
 pub mod jwt;
@@ -18,7 +20,9 @@ pub mod pgoutput;
 pub mod presence;
 pub mod protocol;
 pub mod replication;
+pub mod sio;
 pub mod socket;
+pub mod socketio;
 pub mod tenants;
 
 /// Everything a request needs.
@@ -27,6 +31,8 @@ pub struct App {
 	pub registry: tenants::Registry,
 	pub hub: hub::Hub,
 	pub dbs: db::Databases,
+	/// Socket.IO sessions, by their Engine.IO sid.
+	pub sio: sio::Sessions,
 }
 
 /// Every hour, for each project this process has set up: the days ahead get their message
@@ -73,6 +79,14 @@ pub mod fuzz {
 	/// A logical decoding message from the project's database.
 	pub fn pgoutput(data: &[u8]) {
 		let _ = crate::pgoutput::decode(bytes::Bytes::copy_from_slice(data));
+	}
+
+	/// A Socket.IO client's bytes: an Engine.IO polling body, and a Socket.IO packet.
+	pub fn socketio(data: &[u8]) {
+		if let Ok(text) = std::str::from_utf8(data) {
+			let _ = crate::engineio::decode_payload(text);
+			let _ = crate::socketio::decode(text);
+		}
 	}
 
 	/// A token, against a project secret.

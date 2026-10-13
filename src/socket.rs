@@ -137,7 +137,7 @@ fn unmatched(closed: Option<&str>) -> Value {
 
 /// Whether a channel is sent a hub broadcast of `event`.
 fn may_receive(private: bool, policies: &Policies, event: &str) -> bool {
-	event != "roster_diff" || can_read_presence(private, policies)
+	event != "presence_diff" || can_read_presence(private, policies)
 }
 
 pub fn now_secs() -> i64 {
@@ -145,6 +145,54 @@ pub fn now_secs() -> i64 {
 		.duration_since(UNIX_EPOCH)
 		.map(|d| d.as_secs() as i64)
 		.unwrap_or(0)
+}
+
+/// A project's pool, its schema prepared on first use (once per project per process).
+pub async fn project_pool(
+	app: &Arc<App>,
+	rt: &Arc<TenantRt>,
+) -> Result<deadpool_postgres::Pool, String> {
+	let tenant = rt.tenant();
+	let Some(database) = tenant.database.clone() else {
+		return Err(
+			"UnableToConnectToProject: Realtime was unable to connect to the project database"
+				.into(),
+		);
+	};
+	let pool = app
+		.dbs
+		.pool(&tenant.external_id, &database)
+		.await
+		.map_err(|e| format!("UnableToConnectToProject: {e}"))?;
+	let mut prepared = rt.prepared.lock().await;
+	if !*prepared {
+		db::prepare(&pool).await.map_err(|e| {
+			format!(
+				"UnableToConnectToProject: Realtime was unable to connect to the project database: {e}"
+			)
+		})?;
+		*prepared = true;
+	}
+	Ok(pool)
+}
+
+/// Start broadcast from the database for a project if it is not running (it runs while the
+/// project has sockets, and stops itself a minute after the last one goes).
+pub async fn ensure_messages(app: &Arc<App>, rt: &Arc<TenantRt>) {
+	let tenant = rt.tenant();
+	let Some(database) = tenant.database.clone() else {
+		return;
+	};
+	let streams = rt.streams.lock().await;
+	if streams.messages.as_ref().is_some_and(|t| !t.is_finished()) {
+		return;
+	}
+	drop(streams);
+	let Ok(pool) = project_pool(app, rt).await else {
+		return;
+	};
+	let task = tokio::spawn(crate::messages::run(rt.clone(), pool, database));
+	rt.streams.lock().await.messages = Some(task);
 }
 
 /// What a connection was accepted with.
@@ -448,18 +496,19 @@ impl Socket {
 				let claims = channel.auth.claims.clone();
 				self.channels.insert(m.topic.clone(), channel);
 				self.rt.joined(self.id);
+				crate::handlers::warm(&self.app, &self.rt);
 				self.ensure_messages().await;
 				for f in after {
 					self.push(f);
 				}
 				if presence {
-					let state = self.rt.roster_state(&key);
+					let state = self.rt.presence_state(&key);
 					let f = protocol::message(
 						self.vsn,
 						&join_ref,
 						&None,
 						&m.topic,
-						"roster_state",
+						"presence_state",
 						state,
 					);
 					self.push(f);
@@ -609,7 +658,7 @@ impl Socket {
 		// postgres_changes bindings, each with the id the client will match by.
 		let mut bindings = Vec::new();
 		let mut described = Vec::new();
-		if let Some(Value::Array(list)) = config.get("changes") {
+		if let Some(Value::Array(list)) = config.get("postgres_changes") {
 			for p in list.iter().filter(|p| !p.is_null()) {
 				let id = changes::binding_id(p);
 				let mut with_id = p.as_object().cloned().unwrap_or_default();
@@ -649,7 +698,7 @@ impl Socket {
 				self.vsn,
 				&m.topic,
 				&channel_join_ref(self.vsn, m),
-				json!({ "message": e, "status": "error", "extension": "changes", "channel": name }),
+				json!({ "message": e, "status": "error", "extension": "postgres_changes", "channel": name }),
 			));
 			parsed.clear();
 		}
@@ -702,50 +751,16 @@ impl Socket {
 			bindings: parsed,
 			confirm_at,
 		};
-		Ok((channel, json!({ "changes": described }), after))
+		Ok((channel, json!({ "postgres_changes": described }), after))
 	}
 
 	/// Broadcast from the database runs while a project has sockets, started by its first join.
 	async fn ensure_messages(&self) {
-		let tenant = self.rt.tenant();
-		let Some(database) = tenant.database.clone() else {
-			return;
-		};
-		let streams = self.rt.streams.lock().await;
-		if streams.messages.as_ref().is_some_and(|t| !t.is_finished()) {
-			return;
-		}
-		drop(streams);
-		let Ok(pool) = self.pool().await else { return };
-		let rt = self.rt.clone();
-		let task = tokio::spawn(crate::messages::run(rt, pool, database));
-		self.rt.streams.lock().await.messages = Some(task);
+		ensure_messages(&self.app, &self.rt).await;
 	}
 
 	async fn pool(&self) -> Result<deadpool_postgres::Pool, String> {
-		let tenant = self.rt.tenant();
-		let Some(database) = tenant.database.clone() else {
-			return Err(
-				"UnableToConnectToProject: Realtime was unable to connect to the project database"
-					.into(),
-			);
-		};
-		let pool = self
-			.app
-			.dbs
-			.pool(&tenant.external_id, &database)
-			.await
-			.map_err(|e| format!("UnableToConnectToProject: {e}"))?;
-		let mut prepared = self.rt.prepared.lock().await;
-		if !*prepared {
-			db::prepare(&pool).await.map_err(|e| {
-				format!(
-					"UnableToConnectToProject: Realtime was unable to connect to the project database: {e}"
-				)
-			})?;
-			*prepared = true;
-		}
-		Ok(pool)
+		project_pool(&self.app, &self.rt).await
 	}
 
 	async fn subscribe_changes(
@@ -796,13 +811,13 @@ impl Socket {
 			Ok(()) => self.system(
 				topic,
 				join_ref,
-				"changes",
+				"postgres_changes",
 				"ok",
 				"Subscribed to PostgreSQL",
 				name,
 			),
 			Err(e) => {
-				self.system(topic, join_ref, "changes", "error", &e, name);
+				self.system(topic, join_ref, "postgres_changes", "error", &e, name);
 				if let Some(ch) = self.channels.get_mut(topic) {
 					ch.bindings.clear();
 				}
@@ -1076,6 +1091,9 @@ impl Socket {
 			self.shutdown(&topic, "Too many messages per second").await;
 			return;
 		}
+		if self.handled(&m).await {
+			return;
+		}
 		match &m.payload {
 			InboundPayload::UserBroadcast {
 				user_event,
@@ -1104,6 +1122,116 @@ impl Socket {
 		if ack {
 			self.reply(&m, "ok", json!({}));
 		}
+	}
+
+	/// Run the project's handler for this broadcast, if it has one (H4: a handled broadcast is
+	/// not relayed as it arrived; the handler sends what it means to with `realtime.emit()`).
+	/// The reply carries the handler's result, whether or not the channel asked for acks, since
+	/// the result is the point of calling it. False when no handler applies.
+	async fn handled(&mut self, m: &Inbound) -> bool {
+		let (event, payload) = match &m.payload {
+			InboundPayload::Json(v) => (
+				v.get("event")
+					.and_then(Value::as_str)
+					.unwrap_or_default()
+					.to_string(),
+				Ok(v.get("payload").cloned().unwrap_or(Value::Null)),
+			),
+			InboundPayload::UserBroadcast {
+				user_event,
+				encoding,
+				payload,
+				..
+			} => (
+				user_event.clone(),
+				match encoding {
+					protocol::Encoding::Json => {
+						serde_json::from_slice::<Value>(payload).map_err(|_| "invalid_json")
+					}
+					protocol::Encoding::Binary => Err("binary_not_supported"),
+				},
+			),
+			InboundPayload::Bytes(_) => return false,
+		};
+		let Some(ch) = self.channels.get(&m.topic) else {
+			return false;
+		};
+		let handlers = crate::handlers::current(&self.app, &self.rt).await;
+		let Some(handler) = crate::handlers::find(&handlers, &event, &ch.name).cloned() else {
+			// `@snoutdata/client`'s `call()` marks its message: told, rather than relayed and left
+			// to time out.
+			let call = matches!(&m.payload, InboundPayload::Json(v) if v.get("call") == Some(&Value::Bool(true)));
+			if call {
+				let name = ch.name.clone();
+				let message = format!("No realtime handler is registered for {event} on {name}");
+				self.reply(
+					m,
+					"error",
+					json!({ "error": { "code": "no_handler", "message": message } }),
+				);
+			}
+			return call;
+		};
+		let payload = match payload {
+			Ok(p) => p,
+			Err(code) => {
+				let message = "A handler takes a JSON payload";
+				self.reply(
+					m,
+					"error",
+					json!({ "error": { "code": code, "message": message } }),
+				);
+				return true;
+			}
+		};
+		let auth = ch.auth.clone();
+		let args = Value::Array(vec![payload.clone()]);
+		let outcome = match crate::handlers::pool(&self.app, &self.rt).await {
+			Ok(pool) => {
+				let call = crate::handlers::Call {
+					auth: &auth,
+					event: &event,
+					payload: &payload,
+					args: &args,
+					socket_id: None,
+				};
+				crate::handlers::invoke(&pool, &handler, &call).await
+			}
+			Err(e) => Err(crate::handlers::Failure {
+				code: "unavailable".into(),
+				message: e,
+			}),
+		};
+		match outcome {
+			Ok(o) => {
+				for op in o.ops {
+					if let crate::handlers::Op::Emit {
+						topic,
+						event,
+						payload,
+						except_self,
+					} = op
+					{
+						let except = except_self.then_some(self.id);
+						crate::handlers::deliver_emit(&self.rt, &topic, &event, payload, except);
+					}
+				}
+				self.reply(m, "ok", json!({ "result": o.result }));
+			}
+			Err(f) => {
+				self.rt.log.push(
+					Event::new(Kind::HandlerFailed)
+						.socket(self.id)
+						.channel(&auth.topic)
+						.reason(format!(
+							"{event} -> {}: {} {}",
+							handler.function, f.code, f.message
+						)),
+				);
+				self.reply(m, "error", f.to_json());
+			}
+		}
+		true
 	}
 
 	// --- presence -------------------------------------------------------------------------
@@ -1181,13 +1309,13 @@ impl Socket {
 				// Enabling presence by tracking sends the state first, so the members already
 				// there are seen.
 				if enabling && can_read {
-					let state = self.rt.roster_state(&key);
+					let state = self.rt.presence_state(&key);
 					let f = protocol::message(
 						self.vsn,
 						&join_ref,
 						&None,
 						&m.topic,
-						"roster_state",
+						"presence_state",
 						state,
 					);
 					self.push(f);
@@ -1206,7 +1334,7 @@ impl Socket {
 				let diff = self.rt.untrack(&key, sub, &presence_key);
 				if !diff.is_empty() {
 					let f =
-						protocol::broadcast(self.vsn, &m.topic, "roster_diff", diff.payload());
+						protocol::broadcast(self.vsn, &m.topic, "presence_diff", diff.payload());
 					self.push(f);
 				}
 				self.rt.broadcast_diff_except(&key, &diff, Some(sub));
@@ -1283,7 +1411,7 @@ impl Socket {
 				}
 				// `data` is JSON the change stream serialised once for every channel.
 				let raw = format!("{{\"ids\":{},\"data\":{}}}", Value::from(ids), data);
-				let f = protocol::broadcast_raw(self.vsn, &join_topic, "changes", &raw);
+				let f = protocol::broadcast_raw(self.vsn, &join_topic, "postgres_changes", &raw);
 				self.push(f);
 			}
 			Out::System {
@@ -1399,20 +1527,20 @@ mod tests {
 			presence_read: Some(true),
 			..Policies::default()
 		};
-		assert!(!may_receive(true, &refused, "roster_diff"));
-		assert!(!may_receive(true, &unasked, "roster_diff"));
-		assert!(may_receive(true, &allowed, "roster_diff"));
+		assert!(!may_receive(true, &refused, "presence_diff"));
+		assert!(!may_receive(true, &unasked, "presence_diff"));
+		assert!(may_receive(true, &allowed, "presence_diff"));
 		// Broadcasts are decided at join, by the broadcast read policy.
 		assert!(may_receive(true, &refused, "broadcast"));
 		// A public channel has no policies to consult.
-		assert!(may_receive(false, &Policies::default(), "roster_diff"));
+		assert!(may_receive(false, &Policies::default(), "presence_diff"));
 	}
 
 	fn join(join_ref: Option<&str>, reference: Option<&str>) -> Inbound {
 		Inbound {
 			join_ref: join_ref.map(str::to_string),
 			reference: reference.map(str::to_string),
-			topic: "live:room".into(),
+			topic: "realtime:room".into(),
 			event: "phx_join".into(),
 			payload: InboundPayload::Json(json!({})),
 		}
@@ -1453,30 +1581,30 @@ mod tests {
 			Vsn::V1,
 			&jr,
 			&jr,
-			"live:room",
+			"realtime:room",
 			"phx_close",
 			json!({}),
 		));
 		assert_eq!(close["ref"], json!("6"));
 		let system = text(system_frame(
 			Vsn::V1,
-			"live:room",
+			"realtime:room",
 			&jr,
 			json!({ "status": "error" }),
 		));
 		assert_eq!(system["event"], json!("system"));
 		assert_eq!(system["ref"], json!("6"));
 		// V2: in the join_ref slot, with `ref` null, as before.
-		let system = text(system_frame(Vsn::V2, "live:room", &jr, json!({})));
+		let system = text(system_frame(Vsn::V2, "realtime:room", &jr, json!({})));
 		assert_eq!(system[0], json!("6"));
 		assert_eq!(system[1], Value::Null);
-		// Nothing else changes shape: roster_state in V1 still has a null ref.
+		// Nothing else changes shape: presence_state in V1 still has a null ref.
 		let state = text(protocol::message(
 			Vsn::V1,
 			&jr,
 			&None,
-			"live:room",
-			"roster_state",
+			"realtime:room",
+			"presence_state",
 			json!({}),
 		));
 		assert_eq!(state["ref"], Value::Null);
@@ -1503,8 +1631,8 @@ mod tests {
 	#[test]
 	fn a_message_on_a_topic_the_server_closed_is_told_why() {
 		let mut closed = Closed::default();
-		closed.remember("live:room", "Too many messages per second");
-		let reply = unmatched(closed.why("live:room"));
+		closed.remember("realtime:room", "Too many messages per second");
+		let reply = unmatched(closed.why("realtime:room"));
 		assert_eq!(reply["reason"], json!("unmatched topic"));
 		assert_eq!(
 			reply["message"],
@@ -1514,12 +1642,12 @@ mod tests {
 		);
 		// A topic never joined is answered as Phoenix answers it.
 		assert_eq!(
-			unmatched(closed.why("live:other")),
+			unmatched(closed.why("realtime:other")),
 			json!({ "reason": "unmatched topic" })
 		);
 		// Joined (or left) again: forgotten.
-		closed.forget("live:room");
-		assert_eq!(closed.why("live:room"), None);
+		closed.forget("realtime:room");
+		assert_eq!(closed.why("realtime:room"), None);
 	}
 
 	#[test]
@@ -1530,18 +1658,18 @@ mod tests {
 		}
 		assert_eq!(closed.0.len(), CLOSED_REMEMBERED);
 		// The oldest went first.
-		assert_eq!(closed.why("live:0"), None);
+		assert_eq!(closed.why("realtime:0"), None);
 		assert_eq!(
 			closed.why(&format!("realtime:{}", CLOSED_REMEMBERED + 9)),
 			Some("why")
 		);
 		// A topic closed twice is remembered once, with the newer reason.
-		closed.remember("live:x", "first");
-		closed.remember("live:x", "second");
+		closed.remember("realtime:x", "first");
+		closed.remember("realtime:x", "second");
 		assert_eq!(
-			closed.0.iter().filter(|(t, _)| t == "live:x").count(),
+			closed.0.iter().filter(|(t, _)| t == "realtime:x").count(),
 			1
 		);
-		assert_eq!(closed.why("live:x"), Some("second"));
+		assert_eq!(closed.why("realtime:x"), Some("second"));
 	}
 }

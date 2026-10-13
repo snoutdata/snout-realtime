@@ -234,7 +234,7 @@ pub fn reply(
 	message(vsn, join_ref, reference, topic, "phx_reply", payload)
 }
 
-/// A server push on a channel (`roster_state`, `system`, `phx_close`, ...).
+/// A server push on a channel (`presence_state`, `system`, `phx_close`, ...).
 pub fn message(
 	vsn: Vsn,
 	join_ref: &Option<String>,
@@ -347,12 +347,12 @@ mod tests {
 	fn v2_text_round_trip() {
 		let m = decode_text(
 			Vsn::V2,
-			r#"["1","2","live:room","phx_join",{"config":{}}]"#,
+			r#"["1","2","realtime:room","phx_join",{"config":{}}]"#,
 		)
 		.unwrap();
 		assert_eq!(m.join_ref.as_deref(), Some("1"));
 		assert_eq!(m.reference.as_deref(), Some("2"));
-		assert_eq!(m.topic, "live:room");
+		assert_eq!(m.topic, "realtime:room");
 		assert_eq!(m.event, "phx_join");
 		let Frame::Text(t) = reply(
 			Vsn::V2,
@@ -366,7 +366,7 @@ mod tests {
 		};
 		assert_eq!(
 			t,
-			r#"["1","2","live:room","phx_reply",{"status":"ok","response":{}}]"#
+			r#"["1","2","realtime:room","phx_reply",{"status":"ok","response":{}}]"#
 		);
 	}
 
@@ -375,11 +375,11 @@ mod tests {
 		let payload = r#"{"ids":[7],"data":{"table":"t","record":{"a":"x \"y\""}}}"#;
 		for vsn in [Vsn::V1, Vsn::V2] {
 			let (Frame::Text(raw), Frame::Text(parsed)) = (
-				broadcast_raw(vsn, "live:r", "changes", payload),
+				broadcast_raw(vsn, "realtime:r", "postgres_changes", payload),
 				broadcast(
 					vsn,
-					"live:r",
-					"changes",
+					"realtime:r",
+					"postgres_changes",
 					serde_json::from_str(payload).unwrap(),
 				),
 			) else {
@@ -451,11 +451,11 @@ mod tests {
 	#[test]
 	fn user_broadcast_encodes_kind_four() {
 		let Frame::Binary(b) =
-			user_broadcast("live:r", "e", None, Encoding::Json, b"{}").unwrap()
+			user_broadcast("realtime:r", "e", None, Encoding::Json, b"{}").unwrap()
 		else {
 			panic!()
 		};
 		assert_eq!(&b[..5], &[4, 10, 1, 0, 1]);
-		assert_eq!(&b[5..], b"live:re{}");
+		assert_eq!(&b[5..], b"realtime:re{}");
 	}
 }

@@ -1,4 +1,4 @@
-//! postgres_changes: subscriptions in `snout_live.listeners`, and the changes each one may see.
+//! postgres_changes: subscriptions in `realtime.subscription`, and the changes each one may see.
 //!
 //! Changes are STREAMED from a logical replication slot (pgoutput) the moment they commit, never
 //! polled, and decided in batches: the changes to one table that have arrived and not been
@@ -31,7 +31,7 @@ use crate::pgoutput::{self, Message, Old, Relation};
 use crate::replication::{Connection, Event, Target};
 use crate::tenants::Database;
 
-/// One binding of one channel: a row in snout_live.listeners.
+/// One binding of one channel: a row in realtime.subscription.
 #[derive(Debug, Clone)]
 pub struct Binding {
 	pub subscription_id: Uuid,
@@ -259,9 +259,9 @@ const INSERT_SQL: &str = "with sub_tables as (
 	  and pub.schemaname like (case $2 when '*' then '%' else $2 end) escape ''
 	  and pub.tablename like (case $3 when '*' then '%' else $3 end) escape ''
 )
-insert into snout_live.listeners as x (subscription_id, entity, filters, claims, action_filter, selected_columns)
+insert into realtime.subscription as x (subscription_id, entity, filters, claims, action_filter, selected_columns)
 select $4::text::uuid, sub_tables.entity,
-	(select coalesce(array_agg(row(f->>0, (f->>1)::snout_live.equality_op, f->>2)::snout_live.user_defined_filter), '{}') from jsonb_array_elements($6::jsonb) f),
+	(select coalesce(array_agg(row(f->>0, (f->>1)::realtime.equality_op, f->>2)::realtime.user_defined_filter), '{}') from jsonb_array_elements($6::jsonb) f),
 	$5, $7, $8
 from sub_tables
 on conflict (subscription_id, entity, filters, action_filter, coalesce(selected_columns, '{}'))
@@ -269,7 +269,7 @@ do update set claims = excluded.claims, created_at = now()
 returning id";
 
 const RECLAIM_SQL: &str =
-	"update snout_live.listeners set claims = $1 where subscription_id = any($2::text[]::uuid[])";
+	"update realtime.subscription set claims = $1 where subscription_id = any($2::text[]::uuid[])";
 
 /// Which stream a loop is reading. `node` is `None` for the database the tenant is registered with
 /// (every project's one stream; a sharded project's home node), and the node's id otherwise.
@@ -602,7 +602,7 @@ impl Changes {
 		let ours: Vec<String> = listeners.keys().map(Uuid::to_string).collect();
 		checker
 			.execute(
-				"delete from snout_live.listeners where not (subscription_id = any($1::text[]::uuid[]))",
+				"delete from realtime.subscription where not (subscription_id = any($1::text[]::uuid[]))",
 				&[&ours],
 			)
 			.await
@@ -947,7 +947,7 @@ impl Changes {
 		let ours: Vec<String> = listeners.keys().map(Uuid::to_string).collect();
 		client
 			.execute(
-				"delete from snout_live.listeners where not (subscription_id = any($1::text[]::uuid[]))",
+				"delete from realtime.subscription where not (subscription_id = any($1::text[]::uuid[]))",
 				&[&ours],
 			)
 			.await
@@ -1108,7 +1108,7 @@ pub async fn forget_rows(pool: &deadpool_postgres::Pool, ids: &[Uuid]) {
 		let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
 		let _ = client
 			.execute(
-				"delete from snout_live.listeners where subscription_id = any($1::text[]::uuid[])",
+				"delete from realtime.subscription where subscription_id = any($1::text[]::uuid[])",
 				&[&ids],
 			)
 			.await;

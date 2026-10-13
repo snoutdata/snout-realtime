@@ -9,7 +9,7 @@ every project on a SnoutData Cloud host.
 > 2026-09-28 (image 0.1.0).
 
 - **Your policies decide.** A private channel is authorised by the policies on
-  `snout_live.signals`, and a database change reaches a subscriber only if a `select` of that row,
+  `realtime.messages`, and a database change reaches a subscriber only if a `select` of that row,
   run as the subscriber, returns it. The server never decides access itself.
 - **The channel protocol the JavaScript clients speak**, in both serializers (`vsn=1.0.0` JSON
   objects, and `vsn=2.0.0` arrays with binary broadcast frames): join, leave, heartbeat,
@@ -24,12 +24,12 @@ every project on a SnoutData Cloud host.
   a project has many subscribers, each check its own statement, so a
   policy that raises for one subscriber costs that subscriber alone. What a subscriber sees of the
   row is what its role may select.
-- **Broadcast from the database.** A row written to `snout_live.signals` (by `snout_live.signal()` or
+- **Broadcast from the database.** A row written to `realtime.messages` (by `realtime.send()` or
   a trigger of yours) is broadcast to the topic it names, streamed from the WAL, not polled.
 - **Its own schema.** On a project's first connection it creates the `realtime` tables and
   functions (`migrations/0001_realtime.sql`) and its change logic in `snout_realtime`
   (`migrations/0002_changes.sql`), recording each file's hash in `snout_realtime.migrations`;
-  the second is replaced whenever it changes. `snout_live.signals` is partitioned by day: every
+  the second is replaced whenever it changes. `realtime.messages` is partitioned by day: every
   hour, partitions are made three days ahead and those older than three days are dropped.
 - **Many projects, one process.** A tenant (a project) is registered through an admin API with its
   database and its JWT secret; sockets are routed to it by host name.
@@ -56,7 +56,7 @@ podman build -f realtime/Containerfile -t snout-realtime .   # from the workspac
 
 | Variable | Default | Secret | What |
 |---|---|---|---|
-| `PORT` | `4000` | no | Sockets (`/socket/websocket`), the tenant API, `/metrics`, `/` |
+| `PORT` | `4000` | no | Sockets (`/socket/websocket`, `/socket/socket.io/`), the tenant API, `/metrics`, `/` |
 | `HOST` | `0.0.0.0` | no | Where it listens |
 | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | port `5432` | the password | The metadata database that holds the tenants |
 | `API_JWT_SECRET` | none, required | yes | Verifies the tenant API's bearer token |
@@ -88,7 +88,34 @@ Every call carries `Authorization: Bearer <JWT signed with API_JWT_SECRET>`.
 `POST /api/broadcast/{topic}/events/{event}` with the payload as the body (`application/json`, or
 bytes with `application/octet-stream`; `?private=true` for a private channel). Either takes the
 project's key or a user's token, and a private message is sent only if the caller's policy on
-`snout_live.signals` allows the insert.
+`realtime.messages` allows the insert.
+
+## Handlers
+
+A SQL function of the project's, registered with `realtime.on(event, 'fn(jsonb)', topic)`, runs
+when a client sends that event on a matching topic (exact, a `room:*` prefix, or `*`): in one
+transaction, as the subscriber (the role, claims and headers the authorisation probes set), with
+a 5 s statement timeout, on a pool of its own so a flood of calls never waits on the change
+stream's connections. Its return value is the reply (`{ "result": ... }`, or `{ "error": { code,
+message } }`). A handled broadcast is not relayed; the function sends with
+`realtime.emit(topic, event, payload, except_self)`, which writes nothing to a table: it appends
+to a transaction-local setting the server reads back before the commit and delivers after it.
+`realtime.join()`/`leave()` do the same for Socket.IO rooms. The table is
+`migrations/0003_handlers.sql`, applied by hash like `0002`; the server reads it at most every two
+seconds. Handlers need the tenant's database, so a tenant registered without `postgres_cdc_rls`
+has none. A broadcast whose payload carries `"call": true` and has no handler is answered
+`no_handler` instead of being relayed.
+
+## Socket.IO
+
+`GET`/`POST /socket/socket.io/` speaks Engine.IO 4 (long-polling, websocket, and the upgrade
+between them) carrying Socket.IO 5, so `socket.io-client` connects unmodified. A connect is
+admitted as a Phoenix socket is (the project from the host, its key, the address cap), then
+authorised by `auth.token`. The server's side is the handlers: `connection` (raise to refuse),
+one per event (its return value is the ack), and `disconnect`. A room is a topic, subscribed on
+its public and private keys and delivered once, so it is shared with Phoenix channels of the same
+name and reached by `realtime.send()`. Binary from a client is refused; binary to one is an
+attachment. The user's guide is https://docs.snoutdata.com/stack/socketio.
 
 ## Inspection
 
@@ -98,9 +125,9 @@ presence state, and its last minute of broadcasts in, deliveries out and the bus
 `GET /socket/events` (`?since=<epoch ms>&channel=`) is a log of the newest thousand connects,
 refused connects, joins, refused joins, leaves, channels the server closed and disconnects, each
 with its reason (the client's close code and reason, a lost connection, a rate limit). Both are
-per project from the `Host`, in memory, and answer only the project's `snout_server` token: they
-are every user's presence, which the app key in a web page must not read. Under `/socket` so a
-gateway that maps `/v1/live` to `/socket` reaches them with no route of its own.
+per project from the `Host`, in memory, and answer only the project's `service_role` token: they
+are every user's presence, which the anon key in a web page must not read. Under `/socket` so a
+gateway that maps `/realtime/v1` to `/socket` reaches them with no route of its own.
 
 ## Operating it
 
@@ -153,7 +180,8 @@ above is not granted.
 `bash scripts/test.sh` runs the checks in a container; Docker or Podman is the only thing you
 need. `bash tests/db.sh` runs the same suite against a throwaway Postgres 17, database tests
 included: who sees each change, and what of it. `bash tests/cluster.sh [18|13]` runs a sharded
-project's streams against three throwaway Postgres servers.
+project's streams against three throwaway Postgres servers. `bash tests/socketio.sh` drives the
+handlers and the Socket.IO door with the real `socket.io-client` and a raw Phoenix client.
 
 ## Licence
 

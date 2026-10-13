@@ -301,6 +301,8 @@ pub struct TenantRt {
 	pub prepared: tokio::sync::Mutex<bool>,
 	/// The database streams, started on first need.
 	pub streams: tokio::sync::Mutex<Streams>,
+	/// The project's realtime handlers, as last read (`handlers.rs`).
+	pub handlers: crate::handlers::Cache,
 }
 
 #[derive(Default)]
@@ -363,7 +365,7 @@ impl TenantRt {
 	}
 
 	/// The subscribers of every topic of this project named `name` with a given privacy.
-	pub fn roster_state(&self, key: &TopicKey) -> Value {
+	pub fn presence_state(&self, key: &TopicKey) -> Value {
 		self.topics()
 			.get(key)
 			.map(|t| t.presence.state())
@@ -426,7 +428,7 @@ impl TenantRt {
 		for s in subs {
 			s.tx.send(Out::Broadcast {
 				join_topic: s.join_topic.clone(),
-				event: "roster_diff".into(),
+				event: "presence_diff".into(),
 				payload: payload.clone(),
 				size,
 			});
@@ -612,6 +614,7 @@ impl Hub {
 			log: inspect::EventLog::default(),
 			prepared: tokio::sync::Mutex::new(false),
 			streams: tokio::sync::Mutex::new(Streams::default()),
+			handlers: Default::default(),
 		});
 		all.insert(tenant.external_id.clone(), rt.clone());
 		rt
@@ -702,13 +705,59 @@ pub fn deliver_json(
 	n
 }
 
+/// Deliver a JSON broadcast to everyone on a topic NAME, its public and private subscribers both,
+/// leaving out every subscriber on `except_socket`. A Socket.IO socket in a room is subscribed
+/// to both (`sio.rs`), so subscribers are taken once per socket and join topic, never twice.
+/// What a realtime handler's `realtime.emit()` uses.
+pub fn deliver_json_to_name(
+	rt: &TenantRt,
+	name: &str,
+	except_socket: Option<u64>,
+	payload: Value,
+) -> usize {
+	let mut seen = HashSet::new();
+	let mut subs = Vec::new();
+	for private in [false, true] {
+		let key = TopicKey {
+			name: name.to_string(),
+			private,
+		};
+		for s in rt.subscribers(&key, None) {
+			if Some(s.socket) != except_socket && seen.insert((s.socket, s.join_topic.clone())) {
+				subs.push(s);
+			}
+		}
+	}
+	if subs.is_empty() {
+		return 0;
+	}
+	let size = payload.to_string().len();
+	let payload = Arc::new(payload);
+	let n = subs.len();
+	for s in subs {
+		s.tx.send(Out::Broadcast {
+			join_topic: s.join_topic.clone(),
+			event: "broadcast".into(),
+			payload: payload.clone(),
+			size,
+		});
+	}
+	rt.counters.events.fetch_add(n as u64, Ordering::Relaxed);
+	let key = TopicKey {
+		name: name.to_string(),
+		private: true,
+	};
+	rt.record(&key, |w| w.broadcast(n));
+	n
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	fn change(bytes: usize) -> Out {
 		Out::Changes {
-			join_topic: "live:x".into(),
+			join_topic: "realtime:x".into(),
 			ids: vec![1],
 			data: Arc::from("a".repeat(bytes)),
 		}
@@ -769,6 +818,66 @@ mod tests {
 		assert!(tx.send(Out::Disconnect));
 		assert!(matches!(rx.recv().await, Some(Out::Changes { .. })));
 		assert!(matches!(rx.recv().await, Some(Out::Disconnect)));
+	}
+
+	fn sub(id: u64, socket: u64, join_topic: &str, tx: &Outbox) -> Sub {
+		Sub {
+			id,
+			socket,
+			join_topic: join_topic.into(),
+			tx: tx.clone(),
+			replayed: Arc::new(HashSet::new()),
+			presence_key: Arc::from("k"),
+			joined_at: 0,
+		}
+	}
+
+	#[tokio::test]
+	async fn an_emit_reaches_a_socket_on_both_keys_once_and_skips_the_caller() {
+		let hub = Hub::default();
+		let tenant = crate::tenants::Tenant {
+			external_id: "p".into(),
+			name: "p".into(),
+			jwt_secret: "s".into(),
+			max_concurrent_users: 10,
+			max_channels_per_client: 10,
+			max_events_per_second: 10,
+			max_joins_per_second: 10,
+			max_presence_events_per_second: 10,
+			max_payload_size_in_kb: 10,
+			private_only: false,
+			presence_enabled: false,
+			database: None,
+			postgres_changes_refusal: None,
+		};
+		let rt = hub.tenant(Arc::new(tenant));
+		let (a, mut a_rx) = outbox();
+		let (b, mut b_rx) = outbox();
+		let public = TopicKey {
+			name: "room:1".into(),
+			private: false,
+		};
+		let private = TopicKey {
+			name: "room:1".into(),
+			private: true,
+		};
+		// A Socket.IO socket (1) in the room on both keys; a channel (2) on the public one.
+		rt.subscribe(&public, sub(10, 1, "/", &a));
+		rt.subscribe(&private, sub(11, 1, "/", &a));
+		rt.subscribe(&public, sub(20, 2, "realtime:room:1", &b));
+		assert_eq!(
+			deliver_json_to_name(&rt, "room:1", None, serde_json::json!({})),
+			2
+		);
+		assert!(a_rx.try_recv().is_some());
+		assert!(a_rx.try_recv().is_none());
+		assert!(b_rx.try_recv().is_some());
+		assert_eq!(
+			deliver_json_to_name(&rt, "room:1", Some(1), serde_json::json!({})),
+			1
+		);
+		assert!(a_rx.try_recv().is_none());
+		assert!(b_rx.try_recv().is_some());
 	}
 
 	#[test]

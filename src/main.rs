@@ -19,6 +19,7 @@ async fn serve() -> Result<(), String> {
 		registry,
 		hub: hub::Hub::default(),
 		dbs: db::Databases::default(),
+		sio: Default::default(),
 	});
 	let listener = tokio::net::TcpListener::bind(&address)
 		.await

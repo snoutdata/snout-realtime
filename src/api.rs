@@ -31,8 +31,17 @@ pub fn router(app: Arc<App>) -> Router {
 			get(|| async { axum::Json(json!({ "message": "Success" })) }),
 		)
 		.route("/socket/websocket", get(websocket))
-		// Under `/socket` so the front door's `/v1/live` prefix reaches them as it reaches the
-		// socket: `/v1/live/inspect` and `/v1/live/events`. The project's snout_server
+		// Socket.IO (`sio.rs`), both transports, at the front door's `/realtime/v1/socket.io/`.
+		.route(
+			"/socket/socket.io/",
+			get(crate::sio::get).post(crate::sio::post),
+		)
+		.route(
+			"/socket/socket.io",
+			get(crate::sio::get).post(crate::sio::post),
+		)
+		// Under `/socket` so the front door's `/realtime/v1` prefix reaches them as it reaches the
+		// socket: `/realtime/v1/inspect` and `/realtime/v1/events`. The project's service_role
 		// key only (`owner`).
 		.route("/socket/inspect", get(inspect))
 		.route("/socket/events", get(events))
@@ -62,7 +71,7 @@ fn json_response(status: StatusCode, body: Value) -> Response {
 }
 
 /// The project a request is for: the first label of its host, as the front door sets it.
-fn external_id(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn external_id(headers: &HeaderMap) -> Option<String> {
 	let host = headers
 		.get("x-forwarded-host")
 		.or_else(|| headers.get("host"))?
@@ -95,13 +104,36 @@ async fn websocket(
 	Query(params): Query<HashMap<String, String>>,
 	upgrade: WebSocketUpgrade,
 ) -> Response {
-	let forbidden = || StatusCode::FORBIDDEN.into_response();
-	let Some(id) = external_id(&headers) else {
-		return forbidden();
+	let accepted = match admit(&app, &headers, &params).await {
+		Ok(a) => a,
+		Err(r) => return *r,
+	};
+	// 4 KiB buffers, not the default 128 KiB each way, which let a thousand sockets hold up to
+	// 256 MiB between them. A frame is still read or written whole, whatever its size, and every
+	// frame is flushed as it is sent. A frame or message over the pinned server's 5 MB is refused
+	// and the socket closed, where tungstenite would otherwise read up to 64 MiB of it.
+	upgrade
+		.read_buffer_size(4096)
+		.write_buffer_size(4096)
+		.max_frame_size(socket::MAX_FRAME_SIZE)
+		.max_message_size(socket::MAX_FRAME_SIZE)
+		.on_upgrade(move |ws| socket::serve(app, ws, accepted))
+}
+
+/// Whether a new socket (either door) may open: the project from the host, its key verified,
+/// and the per-address cap. What it was accepted with, or the answer to refuse it with.
+pub(crate) async fn admit(
+	app: &Arc<App>,
+	headers: &HeaderMap,
+	params: &HashMap<String, String>,
+) -> Result<Accepted, Box<Response>> {
+	let forbidden = || Box::new(StatusCode::FORBIDDEN.into_response());
+	let Some(id) = external_id(headers) else {
+		return Err(forbidden());
 	};
 	let tenant = match app.registry.get(&id).await {
 		Ok(Some(t)) => t,
-		_ => return forbidden(),
+		_ => return Err(forbidden()),
 	};
 	let token = headers
 		.get("x-api-key")
@@ -113,14 +145,14 @@ async fn websocket(
 			rt.log
 				.push(Event::new(Kind::ConnectRefused).reason("no API key"));
 		}
-		return forbidden();
+		return Err(forbidden());
 	};
 	if let Err(e) = jwt::authorize(&token, &tenant.jwt_secret, now_secs()) {
 		app.hub
 			.tenant(tenant)
 			.log
 			.push(Event::new(Kind::ConnectRefused).reason(e.message()));
-		return forbidden();
+		return Err(forbidden());
 	}
 	let rt = app.hub.tenant(tenant);
 	// One client address may not hold every socket a project is allowed.
@@ -136,11 +168,13 @@ async fn websocket(
 		rt.log.push(
 			Event::new(Kind::ConnectRefused).reason("Too many connections from this address"),
 		);
-		return (
-			StatusCode::TOO_MANY_REQUESTS,
-			"Too many connections from this address",
-		)
-			.into_response();
+		return Err(Box::new(
+			(
+				StatusCode::TOO_MANY_REQUESTS,
+				"Too many connections from this address",
+			)
+				.into_response(),
+		));
 	}
 	let mut x_headers = Map::new();
 	for (name, value) in headers.iter() {
@@ -151,36 +185,26 @@ async fn websocket(
 			x_headers.insert(name.as_str().to_string(), Value::String(v.to_string()));
 		}
 	}
-	let accepted = Accepted {
+	Ok(Accepted {
 		rt,
 		vsn: Vsn::from_param(params.get("vsn").map(String::as_str)),
 		token,
 		headers: x_headers,
 		address,
-	};
-	// 4 KiB buffers, not the default 128 KiB each way, which let a thousand sockets hold up to
-	// 256 MiB between them. A frame is still read or written whole, whatever its size, and every
-	// frame is flushed as it is sent. A frame or message over the pinned server's 5 MB is refused
-	// and the socket closed, where tungstenite would otherwise read up to 64 MiB of it.
-	upgrade
-		.read_buffer_size(4096)
-		.write_buffer_size(4096)
-		.max_frame_size(socket::MAX_FRAME_SIZE)
-		.max_message_size(socket::MAX_FRAME_SIZE)
-		.on_upgrade(move |ws| socket::serve(app, ws, accepted))
+	})
 }
 
 // --- inspection (inspect.rs) --------------------------------------------------------------
 
-/// The project from the host, and the caller only if it holds the project's `snout_server`
+/// The project from the host, and the caller only if it holds the project's `service_role`
 /// key: what is inspected here is every player's presence and the log of who left and why,
-/// which is the owner's to read and never a stranger's holding the app key from a web page.
+/// which is the owner's to read and never a stranger's holding the anon key from a web page.
 async fn owner(app: &App, headers: &HeaderMap) -> Result<Arc<tenants::Tenant>, Box<Response>> {
 	let (tenant, claims) = http_caller(app, headers).await?;
-	if claims.get("role").and_then(Value::as_str) != Some("snout_server") {
+	if claims.get("role").and_then(Value::as_str) != Some("service_role") {
 		return Err(Box::new(json_response(
 			StatusCode::FORBIDDEN,
-			json!({ "message": "Inspecting Realtime needs the project's server key" }),
+			json!({ "message": "Inspecting Realtime needs the project's service_role key" }),
 		)));
 	}
 	Ok(tenant)

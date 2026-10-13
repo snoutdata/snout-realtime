@@ -4,7 +4,7 @@
 //! **This server never decides who may read or write a topic, or see a row; the project's
 //! database does.** Authorisation is the pinned server's method, statement for statement: in a
 //! transaction that is always rolled back, a probe row per extension is inserted into
-//! `snout_live.signals` for the topic, the connection BECOMES the subscriber
+//! `realtime.messages` for the topic, the connection BECOMES the subscriber
 //! (`set_config('role', ...)` plus the claims and headers the customer's policies read), and the
 //! customer's SELECT policies decide which probe rows come back (read) or their INSERT policies
 //! decide which a subscriber may add (write).
@@ -22,6 +22,7 @@ use crate::tenants::Database;
 
 const SCHEMA: &str = include_str!("../migrations/0001_realtime.sql");
 const CHANGES: &str = include_str!("../migrations/0002_changes.sql");
+const HANDLERS: &str = include_str!("../migrations/0003_handlers.sql");
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -84,7 +85,7 @@ pub struct Policies {
 	pub presence_write: Option<bool>,
 }
 
-/// One broadcast kept in snout_live.signals, for replay.
+/// One broadcast kept in realtime.messages, for replay.
 #[derive(Debug, Clone)]
 pub struct Stored {
 	pub id: String,
@@ -112,10 +113,22 @@ impl Databases {
 		Ok(pool)
 	}
 
-	/// Drop a project's pool (the tenant was deleted or its database moved).
-	pub async fn forget(&self, tenant: &str) {
-		self.pools.lock().await.remove(tenant);
+	/// The pool a project's handlers run on: its own, so a flood of handler calls waits on
+	/// itself and never on the change stream's or the join checks' connections (H7).
+	pub async fn handler_pool(&self, tenant: &str, db: &Database) -> Result<Pool, DbError> {
+		self.pool(&handler_key(tenant), db).await
 	}
+
+	/// Drop a project's pools (the tenant was deleted or its database moved).
+	pub async fn forget(&self, tenant: &str) {
+		let mut pools = self.pools.lock().await;
+		pools.remove(tenant);
+		pools.remove(&handler_key(tenant));
+	}
+}
+
+fn handler_key(tenant: &str) -> String {
+	format!("{tenant}#handlers")
 }
 
 /// A pool of at most `size` connections to one database, each made when first asked for.
@@ -173,24 +186,26 @@ pub async fn prepare(pool: &Pool) -> Result<(), DbError> {
 	)
 	.await
 	.map_err(sql_error)?;
-	let hash = sha256_hex(CHANGES);
-	let current: Option<String> = tx
-		.query_opt(
-			"select sha256 from snout_realtime.migrations where name = 'changes'",
-			&[],
-		)
-		.await
-		.map_err(sql_error)?
-		.map(|r| r.get(0));
-	if current.as_deref() != Some(hash.as_str()) {
-		tx.batch_execute(CHANGES).await.map_err(sql_error)?;
-		tx.execute(
-			"insert into snout_realtime.migrations (name, sha256) values ('changes', $1)
-			 on conflict (name) do update set sha256 = excluded.sha256, applied_at = now()",
-			&[&hash],
-		)
-		.await
-		.map_err(sql_error)?;
+	for (name, sql) in [("changes", CHANGES), ("handlers", HANDLERS)] {
+		let hash = sha256_hex(sql);
+		let current: Option<String> = tx
+			.query_opt(
+				"select sha256 from snout_realtime.migrations where name = $1",
+				&[&name],
+			)
+			.await
+			.map_err(sql_error)?
+			.map(|r| r.get(0));
+		if current.as_deref() != Some(hash.as_str()) {
+			tx.batch_execute(sql).await.map_err(sql_error)?;
+			tx.execute(
+				"insert into snout_realtime.migrations (name, sha256) values ($1, $2)
+				 on conflict (name) do update set sha256 = excluded.sha256, applied_at = now()",
+				&[&name, &hash],
+			)
+			.await
+			.map_err(sql_error)?;
+		}
 	}
 	tx.commit().await.map_err(sql_error)?;
 	create_partitions(&client).await
@@ -205,7 +220,7 @@ fn sha256_hex(text: &str) -> String {
 }
 
 /// `realtime.messages_YYYY_MM_DD` from yesterday to three days ahead, as the pinned server
-/// keeps them, so `snout_live.signal()` always has a partition to land in.
+/// keeps them, so `realtime.send()` always has a partition to land in.
 pub async fn create_partitions(client: &deadpool_postgres::Object) -> Result<(), DbError> {
 	client
 		.batch_execute(
@@ -214,7 +229,7 @@ pub async fn create_partitions(client: &deadpool_postgres::Object) -> Result<(),
 			begin
 				for d in select generate_series(current_date - 1, current_date + 3, interval '1 day')::date loop
 					begin
-						execute format('create table if not exists realtime.%I partition of snout_live.signals for values from (%L) to (%L)',
+						execute format('create table if not exists realtime.%I partition of realtime.messages for values from (%L) to (%L)',
 							'messages_' || to_char(d, 'YYYY_MM_DD'), d, d + 1);
 					exception when duplicate_table then null;
 					end;
@@ -235,7 +250,7 @@ pub async fn drop_old_partitions(pool: &Pool) -> Result<(), DbError> {
 			begin
 				for r in select c.relname from pg_inherits i join pg_class p on i.inhparent = p.oid join pg_class c on i.inhrelid = c.oid
 					join pg_namespace n on n.oid = c.relnamespace
-					where p.relname = 'messages' and n.nspname = 'snout_live' and c.relname ~ '^messages_\\d{4}_\\d{2}_\\d{2}$'
+					where p.relname = 'messages' and n.nspname = 'realtime' and c.relname ~ '^messages_\\d{4}_\\d{2}_\\d{2}$'
 				loop
 					if to_date(substr(r.relname, 10), 'YYYY_MM_DD') < (now() - interval '72 hours')::date then
 						execute format('drop table if exists realtime.%I', r.relname);
@@ -266,7 +281,7 @@ fn extensions(presence: bool) -> &'static [&'static str] {
 	}
 }
 
-async fn become_subscriber(
+pub(crate) async fn become_subscriber(
 	tx: &deadpool_postgres::Transaction<'_>,
 	ctx: &AuthContext,
 ) -> Result<(), DbError> {
@@ -295,7 +310,7 @@ pub async fn authorize_read(
 	for ext in extensions(presence) {
 		let row = tx
 			.query_one(
-				"insert into snout_live.signals (topic, extension) values ($1, $2) returning id::text",
+				"insert into realtime.messages (topic, extension) values ($1, $2) returning id::text",
 				&[&ctx.topic, ext],
 			)
 			.await
@@ -306,7 +321,7 @@ pub async fn authorize_read(
 	let wanted: Vec<String> = ids.values().cloned().collect();
 	let seen: Vec<String> = tx
 		.query(
-			"select id::text from snout_live.signals where topic = $1 and id::text = any($2)",
+			"select id::text from realtime.messages where topic = $1 and id::text = any($2)",
 			&[&ctx.topic, &wanted],
 		)
 		.await
@@ -338,7 +353,7 @@ pub async fn authorize_write(
 		.map_err(sql_error)?;
 	let allowed = match tx
 		.execute(
-			"insert into snout_live.signals (topic, extension) values ($1, $2)",
+			"insert into realtime.messages (topic, extension) values ($1, $2)",
 			&[&ctx.topic, &extension],
 		)
 		.await
@@ -369,7 +384,7 @@ pub async fn replay(
 	let rows = client
 		.query(
 			"select id::text, event, payload from (
-				select id, event, payload, inserted_at, ctid from snout_live.signals
+				select id, event, payload, inserted_at, ctid from realtime.messages
 				where topic = $1 and private is true and extension = 'broadcast'
 				  and inserted_at >= to_timestamp($2::float8 / 1000) at time zone 'utc'
 				  and inserted_at < (now() at time zone 'utc') + interval '1 minute'

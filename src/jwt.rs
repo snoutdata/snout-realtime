@@ -163,14 +163,14 @@ mod tests {
 
 	#[test]
 	fn a_good_token_verifies() {
-		let t = sign_hs256(&json!({"role": "snout_app", "exp": 2000}), SECRET);
-		assert_eq!(authorize(&t, SECRET, 1000).unwrap()["role"], "snout_app");
+		let t = sign_hs256(&json!({"role": "anon", "exp": 2000}), SECRET);
+		assert_eq!(authorize(&t, SECRET, 1000).unwrap()["role"], "anon");
 	}
 
 	#[test]
 	fn fractional_dates_are_accepted_and_rounded() {
 		let t = sign_hs256(
-			&json!({"role": "snout_app", "exp": 2000.5, "iat": 999.75}),
+			&json!({"role": "anon", "exp": 2000.5, "iat": 999.75}),
 			SECRET,
 		);
 		let claims = authorize(&t, SECRET, 1000).unwrap();
@@ -184,7 +184,7 @@ mod tests {
 			authorize("not-a-jwt", SECRET, 0).unwrap_err().reason(),
 			"MalformedJWT: The token provided is not a valid JWT"
 		);
-		let expired = sign_hs256(&json!({"role": "snout_app", "exp": 900}), SECRET);
+		let expired = sign_hs256(&json!({"role": "anon", "exp": 900}), SECRET);
 		assert_eq!(
 			authorize(&expired, SECRET, 1000).unwrap_err().message(),
 			"Token has expired 100 seconds ago"
@@ -195,7 +195,7 @@ mod tests {
 			TokenError::MissingClaims
 		);
 		let other = sign_hs256(
-			&json!({"role": "snout_app", "exp": 2000}),
+			&json!({"role": "anon", "exp": 2000}),
 			"a-different-secret-entirely",
 		);
 		assert_eq!(
@@ -206,7 +206,7 @@ mod tests {
 
 	#[test]
 	fn whitespace_and_percent_encoding_are_tidied() {
-		let t = sign_hs256(&json!({"role": "snout_app", "exp": 2000}), SECRET);
+		let t = sign_hs256(&json!({"role": "anon", "exp": 2000}), SECRET);
 		let spaced = format!(" {}\n", t.replace('.', "%2E"));
 		assert!(authorize(&spaced, SECRET, 1000).is_ok());
 	}

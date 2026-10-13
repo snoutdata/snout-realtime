@@ -6,8 +6,8 @@
 //! Several subscribers may track the same key (two tabs of one user), so a key maps to a LIST
 //! of metas, and each one leaves on its own.
 //!
-//!  - `roster_state` is the whole topic, grouped: `{ key: { metas: [meta, ...] } }`.
-//!  - `roster_diff` is what changed: `{ joins: {...}, leaves: {...} }`, grouped the same way.
+//!  - `presence_state` is the whole topic, grouped: `{ key: { metas: [meta, ...] } }`.
+//!  - `presence_diff` is what changed: `{ joins: {...}, leaves: {...} }`, grouped the same way.
 //!  - Tracking again under a key already tracked (an update) is a LEAVE of the old meta and a
 //!    JOIN of the new one, and the new one carries `phx_ref_prev`, the ref it replaced. The
 //!    client builds its state from exactly that pair, which is why it is kept.
@@ -48,7 +48,7 @@ impl Diff {
 		self.joins.is_empty() && self.leaves.is_empty()
 	}
 
-	/// The `roster_diff` payload.
+	/// The `presence_diff` payload.
 	pub fn payload(&self) -> Value {
 		json!({ "joins": group(&self.joins), "leaves": group(&self.leaves) })
 	}
@@ -81,7 +81,7 @@ impl Topic {
 		self.entries.is_empty()
 	}
 
-	/// The `roster_state` payload.
+	/// The `presence_state` payload.
 	pub fn state(&self) -> Value {
 		let items: Vec<(String, Map<String, Value>)> = self
 			.entries
