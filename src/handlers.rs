@@ -124,13 +124,16 @@ async fn refresh(app: &Arc<App>, rt: &Arc<TenantRt>) {
 
 async fn read(app: &Arc<App>, rt: &Arc<TenantRt>) -> Result<Vec<Handler>, String> {
 	let pool = pool(app, rt).await?;
+	let names = pool.names().await.map_err(|e| e.to_string())?;
 	let client = pool.get().await.map_err(|e| e.to_string())?;
 	let rows = client
 		.query(
-			"select h.event, h.topic, quote_ident(n.nspname) || '.' || quote_ident(p.proname)
+			&*names.sql(
+				"select h.event, h.topic, quote_ident(n.nspname) || '.' || quote_ident(p.proname)
 			 from realtime.handlers h
 			 join pg_proc p on p.oid = h.handler::oid
 			 join pg_namespace n on n.oid = p.pronamespace",
+			),
 			&[],
 		)
 		.await
@@ -146,7 +149,7 @@ async fn read(app: &Arc<App>, rt: &Arc<TenantRt>) -> Result<Vec<Handler>, String
 }
 
 /// The handler pool for a project, after its schema is ready.
-pub async fn pool(app: &Arc<App>, rt: &Arc<TenantRt>) -> Result<deadpool_postgres::Pool, String> {
+pub async fn pool(app: &Arc<App>, rt: &Arc<TenantRt>) -> Result<crate::db::Pool, String> {
 	crate::socket::project_pool(app, rt).await?;
 	let tenant = rt.tenant();
 	let database = tenant.database.clone().ok_or(
@@ -223,10 +226,11 @@ impl Failure {
 
 /// Run `handler` for `call`. On success the transaction has committed.
 pub async fn invoke(
-	pool: &deadpool_postgres::Pool,
+	pool: &crate::db::Pool,
 	handler: &Handler,
 	call: &Call<'_>,
 ) -> Result<Outcome, Failure> {
+	let names = pool.names().await.map_err(Failure::from_db)?;
 	let mut client = pool
 		.get()
 		.await
@@ -235,7 +239,7 @@ pub async fn invoke(
 		.transaction()
 		.await
 		.map_err(|e| Failure::from_db(DbError::from_pg(e)))?;
-	db::become_subscriber(&tx, call.auth)
+	db::become_subscriber(&tx, call.auth, &names)
 		.await
 		.map_err(Failure::from_db)?;
 	let args = call.args.to_string();

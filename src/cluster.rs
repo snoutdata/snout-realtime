@@ -38,7 +38,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use deadpool_postgres::Pool;
+use crate::db::Pool;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};

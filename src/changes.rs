@@ -75,7 +75,9 @@ pub struct Changes {
 	/// A sharded project's nodes and sharded tables, as the follower last read them.
 	shape: std::sync::RwLock<Option<Arc<cluster::Shape>>>,
 	/// The other nodes whose streams are open, by node id, with a pool for their subscription rows.
-	nodes: std::sync::Mutex<HashMap<i32, deadpool_postgres::Pool>>,
+	nodes: std::sync::Mutex<HashMap<i32, crate::db::Pool>>,
+	/// The names the project's database has, read when the stream opens (`db::Names`).
+	names: std::sync::RwLock<crate::db::Names>,
 }
 
 /// The id a binding is known by. A stable hash of its parameters, so the same binding gets the
@@ -295,7 +297,12 @@ impl Changes {
 			retired: false.into(),
 			shape: std::sync::RwLock::new(None),
 			nodes: std::sync::Mutex::new(HashMap::new()),
+			names: std::sync::RwLock::new(crate::db::Names::default()),
 		})
+	}
+
+	fn names(&self) -> crate::db::Names {
+		self.names.read().map(|n| n.clone()).unwrap_or_default()
 	}
 
 	/// The settings this stream connects with, to tell whether the tenant's have moved on.
@@ -332,7 +339,7 @@ impl Changes {
 
 	/// The other nodes whose streams are open, each with the pool its subscription rows are
 	/// written through.
-	fn node_pools(&self) -> Vec<(i32, deadpool_postgres::Pool)> {
+	fn node_pools(&self) -> Vec<(i32, crate::db::Pool)> {
 		self.nodes
 			.lock()
 			.unwrap_or_else(|e| e.into_inner())
@@ -345,7 +352,7 @@ impl Changes {
 	pub async fn subscribe(
 		self: &Arc<Self>,
 		rt: Arc<TenantRt>,
-		pool: &deadpool_postgres::Pool,
+		pool: &crate::db::Pool,
 		claims: &Map<String, Value>,
 		bindings: &[Binding],
 		tx: Outbox,
@@ -354,7 +361,9 @@ impl Changes {
 		self.ensure_stream(rt.clone()).await;
 		static CHANNELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 		let channel = CHANNELS.fetch_add(1, Ordering::Relaxed);
-		let stored = Value::Object(claims.clone());
+		// The role as the database names it, since the rows' checks become it there.
+		let names = pool.names().await.map_err(|e| e.to_string())?;
+		let stored = Value::Object(names.claims(claims));
 		// Listening BEFORE the rows exist: the stream's sweep of rows that are not its own
 		// (`sweep`) holds this lock, so a row is either written after it or known to it. A node's
 		// stream writes the rows of every listener there is when it opens (`adopt`), under the
@@ -417,18 +426,19 @@ impl Changes {
 	/// first user's rows.
 	pub async fn reclaim(
 		&self,
-		pool: &deadpool_postgres::Pool,
+		pool: &crate::db::Pool,
 		ids: &[Uuid],
 		claims: &Map<String, Value>,
 	) -> Result<(), String> {
 		if ids.is_empty() {
 			return Ok(());
 		}
-		let claims = Value::Object(claims.clone());
+		let names = pool.names().await.map_err(|e| e.to_string())?;
+		let claims = Value::Object(names.claims(claims));
 		let text: Vec<String> = ids.iter().map(Uuid::to_string).collect();
 		let client = pool.get().await.map_err(|e| e.to_string())?;
 		client
-			.execute(RECLAIM_SQL, &[&claims, &text])
+			.execute(&*names.sql(RECLAIM_SQL), &[&claims, &text])
 			.await
 			.map_err(|e| e.to_string())?;
 		drop(client);
@@ -442,15 +452,19 @@ impl Changes {
 		}
 		// A node that cannot be reached now is given the new claims when its stream opens again.
 		for (_, node) in self.node_pools() {
-			if let Ok(client) = node.get().await {
-				let _ = client.execute(RECLAIM_SQL, &[&claims, &text]).await;
+			if let Ok(names) = node.names().await
+				&& let Ok(client) = node.get().await
+			{
+				let _ = client
+					.execute(&*names.sql(RECLAIM_SQL), &[&claims, &text])
+					.await;
 			}
 		}
 		Ok(())
 	}
 
 	/// Remove a channel's bindings.
-	pub async fn unsubscribe(&self, pool: &deadpool_postgres::Pool, ids: &[Uuid]) {
+	pub async fn unsubscribe(&self, pool: &crate::db::Pool, ids: &[Uuid]) {
 		if ids.is_empty() {
 			return;
 		}
@@ -540,6 +554,14 @@ impl Changes {
 	/// before anybody waiting is told the stream is ready, and closed with this one.
 	async fn stream_until_idle(self: &Arc<Self>, rt: &Arc<TenantRt>) -> Result<(), String> {
 		let (mut conn, first) = Self::open(&self.database).await?;
+		match crate::db::names_of(&first).await {
+			Ok(names) => {
+				if let Ok(mut held) = self.names.write() {
+					*held = names;
+				}
+			}
+			Err(e) => tracing::warn!(tenant = %rt.id, error = %e, "which names the database has"),
+		}
 		let mut checkers = vec![first];
 		match self.sweep(&checkers[0]).await {
 			Ok(0) => {}
@@ -571,7 +593,7 @@ impl Changes {
 		rt: &'a Arc<TenantRt>,
 		node: i32,
 		database: &'a Database,
-		pool: &'a deadpool_postgres::Pool,
+		pool: &'a crate::db::Pool,
 		ready: &'a tokio::sync::watch::Sender<bool>,
 	) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
 		Box::pin(async move {
@@ -596,13 +618,15 @@ impl Changes {
 		rt: &TenantRt,
 		node: i32,
 		checker: &tokio_postgres::Client,
-		pool: &deadpool_postgres::Pool,
+		pool: &crate::db::Pool,
 	) -> Result<NodeRegistration, String> {
 		let listeners = self.listeners.lock().await;
 		let ours: Vec<String> = listeners.keys().map(Uuid::to_string).collect();
 		checker
 			.execute(
-				"delete from realtime.subscription where not (subscription_id = any($1::text[]::uuid[]))",
+				&*self.names().sql(
+					"delete from realtime.subscription where not (subscription_id = any($1::text[]::uuid[]))",
+				),
 				&[&ours],
 			)
 			.await
@@ -947,7 +971,9 @@ impl Changes {
 		let ours: Vec<String> = listeners.keys().map(Uuid::to_string).collect();
 		client
 			.execute(
-				"delete from realtime.subscription where not (subscription_id = any($1::text[]::uuid[]))",
+				&*self.names().sql(
+					"delete from realtime.subscription where not (subscription_id = any($1::text[]::uuid[]))",
+				),
 				&[&ours],
 			)
 			.await
@@ -1030,12 +1056,17 @@ impl Drop for NodeRegistration {
 /// binding that matches no published table is the client's error, in the pinned server's words;
 /// on another node it only means that node does not stream the table.
 async fn insert_bindings(
-	pool: &deadpool_postgres::Pool,
+	pool: &crate::db::Pool,
 	publication: &str,
 	claims: &Value,
 	bindings: &[Binding],
 	required: bool,
 ) -> Result<(), String> {
+	let names = pool
+		.names()
+		.await
+		.map_err(|e| format!("Unable to subscribe to changes: {e}"))?;
+	let insert = names.sql(INSERT_SQL);
 	let mut client = pool
 		.get()
 		.await
@@ -1052,7 +1083,7 @@ async fn insert_bindings(
 		);
 		let result = t
 			.query(
-				INSERT_SQL,
+				&*insert,
 				&[
 					&publication,
 					&b.schema,
@@ -1100,15 +1131,19 @@ async fn insert_bindings(
 /// and then closes the sockets, and the rows of every channel it closed were left behind until the
 /// next subscriber's sweep (QA round 7: a key rotation, and the dashboard counting a subscriber
 /// that had gone).
-pub async fn forget_rows(pool: &deadpool_postgres::Pool, ids: &[Uuid]) {
+pub async fn forget_rows(pool: &crate::db::Pool, ids: &[Uuid]) {
 	if ids.is_empty() {
 		return;
 	}
-	if let Ok(client) = pool.get().await {
+	if let Ok(names) = pool.names().await
+		&& let Ok(client) = pool.get().await
+	{
 		let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
 		let _ = client
 			.execute(
-				"delete from realtime.subscription where subscription_id = any($1::text[]::uuid[])",
+				&*names.sql(
+					"delete from realtime.subscription where subscription_id = any($1::text[]::uuid[])",
+				),
 				&[&ids],
 			)
 			.await;

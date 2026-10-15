@@ -1,37 +1,37 @@
--- The realtime schema in a project's database: the objects a customer's own SQL and policies
--- touch, and nothing else. Run once, by snout-realtime, when the project has no realtime.messages
+-- The `snout_live` schema in a project's database: the objects a customer's own SQL and policies
+-- touch, and nothing else. Run once, by snout-realtime, when the project has no snout_live.signals
 -- yet (a project the pinned server already set up keeps its schema, which has the same tables).
 --
 -- What is here, and why it is the contract:
---   realtime.messages      what realtime.send() writes and private channels' policies are written on;
+--   snout_live.signals     what snout_live.signal() writes and private channels' policies are written on;
 --                          one partition a day, made by the server, kept 72 hours for replay
---   realtime.subscription  one row per postgres_changes binding, as the subscriber; a customer
+--   snout_live.listeners   one row per changes binding, as the subscriber; a customer
 --                          may read it to see who is listening
---   realtime.topic()       the topic a policy on realtime.messages is being asked about
---   realtime.send()        broadcast from SQL (JSON or bytes)
---   realtime.broadcast_changes()  broadcast a row change from a trigger
+--   snout_live.topic()     the topic a policy on snout_live.signals is being asked about
+--   snout_live.signal()    broadcast from SQL (JSON or bytes)
+--   snout_live.broadcast_changes()  broadcast a row change from a trigger
 --
 -- Runs as the project's admin role, the one the server connects as, which owns what it makes.
 
-create schema if not exists realtime;
+create schema if not exists snout_live;
 
-create type realtime.equality_op as enum ('eq', 'neq', 'lt', 'lte', 'gt', 'gte', 'in');
+create type snout_live.equality_op as enum ('eq', 'neq', 'lt', 'lte', 'gt', 'gte', 'in');
 
-create type realtime.action as enum ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'ERROR');
+create type snout_live.action as enum ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'ERROR');
 
-create type realtime.user_defined_filter as (column_name text, op realtime.equality_op, value text);
+create type snout_live.user_defined_filter as (column_name text, op snout_live.equality_op, value text);
 
 -- A role name as a regrole, for the subscription's generated column.
-create function realtime.to_regrole(role_name text) returns regrole
+create function snout_live.to_regrole(role_name text) returns regrole
 	language sql immutable
 	as $body$ select role_name::regrole $body$;
 
 -- The topic being authorised, set by the server before it asks a policy.
-create function realtime.topic() returns text
+create function snout_live.topic() returns text
 	language sql stable
 	as $body$ select nullif(current_setting('realtime.topic', true), '') $body$;
 
-create table realtime.messages (
+create table snout_live.signals (
 	topic text not null,
 	extension text not null,
 	payload jsonb,
@@ -45,27 +45,27 @@ create table realtime.messages (
 	primary key (id, inserted_at)
 ) partition by range (inserted_at);
 
-create index messages_inserted_at_topic_index on realtime.messages (inserted_at desc, topic)
+create index messages_inserted_at_topic_index on snout_live.signals (inserted_at desc, topic)
 	where extension = 'broadcast' and private is true;
 
-alter table realtime.messages enable row level security;
+alter table snout_live.signals enable row level security;
 
-create table realtime.subscription (
+create table snout_live.listeners (
 	id bigint generated always as identity primary key,
 	subscription_id uuid not null,
 	entity regclass not null,
-	filters realtime.user_defined_filter[] not null default '{}',
+	filters snout_live.user_defined_filter[] not null default '{}',
 	claims jsonb not null,
-	claims_role regrole not null generated always as (realtime.to_regrole(claims ->> 'role')) stored,
+	claims_role regrole not null generated always as (snout_live.to_regrole(claims ->> 'role')) stored,
 	created_at timestamp without time zone not null default timezone('utc', now()),
 	action_filter text default '*' check (action_filter in ('*', 'INSERT', 'UPDATE', 'DELETE')),
 	selected_columns text[]
 );
 
-create index ix_realtime_subscription_entity on realtime.subscription (entity);
+create index ix_realtime_subscription_entity on snout_live.listeners (entity);
 
 create unique index subscription_subscription_id_entity_filters_action_filter_selec
-	on realtime.subscription (subscription_id, entity, filters, action_filter, coalesce(selected_columns, '{}'));
+	on snout_live.listeners (subscription_id, entity, filters, action_filter, coalesce(selected_columns, '{}'));
 
 -- A binding is checked when it is written, against what the SUBSCRIBER may read: every filtered
 -- column and every selected column must be one its role may select, a filter's value must be of
@@ -75,11 +75,11 @@ create unique index subscription_subscription_id_entity_filters_action_filter_se
 -- Column privileges are read with has_column_privilege for the subscriber's role, never through
 -- information_schema, which answers for whoever is running this (the server's own role) and so
 -- refused real columns on a database where that role holds no grants.
-create function realtime.subscription_check_filters() returns trigger
+create function snout_live.subscription_check_filters() returns trigger
 	language plpgsql
 	as $body$
 declare
-	f realtime.user_defined_filter;
+	f snout_live.user_defined_filter;
 	col_type regtype;
 	selected text;
 	role_name text := new.claims ->> 'role';
@@ -93,7 +93,7 @@ begin
 			raise exception 'invalid column for filter %', f.column_name;
 		end if;
 		if f.op = 'in' then
-			if coalesce(array_length(realtime.in_list(f.value, col_type), 1), 0) > 100 then
+			if coalesce(array_length(snout_live.in_list(f.value, col_type), 1), 0) > 100 then
 				raise exception 'too many values for `in` filter. Maximum 100';
 			end if;
 		else
@@ -119,11 +119,11 @@ begin
 end
 $body$;
 
-create trigger tr_check_filters before insert or update on realtime.subscription
-	for each row execute function realtime.subscription_check_filters();
+create trigger tr_check_filters before insert or update on snout_live.listeners
+	for each row execute function snout_live.subscription_check_filters();
 
 -- A filter's `in` list, cast to an array of the column's type (raises if a value is not one).
-create function realtime.in_list(list text, type_ regtype) returns text[]
+create function snout_live.in_list(list text, type_ regtype) returns text[]
 	language plpgsql immutable
 	as $body$
 declare
@@ -135,7 +135,7 @@ end
 $body$;
 
 -- Broadcast from SQL, as JSON. The payload gets the message's id when it has none.
-create function realtime.send(payload jsonb, event text, topic text, private boolean default true) returns void
+create function snout_live.signal(payload jsonb, event text, topic text, private boolean default true) returns void
 	language plpgsql
 	as $body$
 declare
@@ -143,7 +143,7 @@ declare
 begin
 	begin
 		perform set_config('realtime.topic', topic, true);
-		insert into realtime.messages (id, payload, event, topic, private, extension)
+		insert into snout_live.signals (id, payload, event, topic, private, extension)
 		values (
 			message_id,
 			case when payload ? 'id' then payload else jsonb_set(payload, '{id}', to_jsonb(message_id)) end,
@@ -156,13 +156,13 @@ end
 $body$;
 
 -- Broadcast from SQL, as bytes.
-create function realtime.send(payload bytea, event text, topic text, private boolean default true) returns void
+create function snout_live.signal(payload bytea, event text, topic text, private boolean default true) returns void
 	language plpgsql
 	as $body$
 begin
 	begin
 		perform set_config('realtime.topic', topic, true);
-		insert into realtime.messages (id, binary_payload, event, topic, private, extension)
+		insert into snout_live.signals (id, binary_payload, event, topic, private, extension)
 		values (gen_random_uuid(), payload, event, topic, private, 'broadcast');
 	exception when others then
 		raise warning 'ErrorSendingBroadcastMessage: %', sqlerrm;
@@ -170,9 +170,9 @@ begin
 end
 $body$;
 
--- Broadcast a row change from a trigger: `realtime.broadcast_changes(topic, event, TG_OP,
+-- Broadcast a row change from a trigger: `snout_live.broadcast_changes(topic, event, TG_OP,
 -- TG_TABLE_NAME, TG_TABLE_SCHEMA, NEW, OLD)`, on a private topic.
-create function realtime.broadcast_changes(
+create function snout_live.broadcast_changes(
 	topic_name text, event_name text, operation text, table_name text, table_schema text,
 	new record, old record, level text default 'ROW'
 ) returns void
@@ -185,7 +185,7 @@ begin
 	if operation not in ('INSERT', 'UPDATE', 'DELETE') then
 		raise exception 'Unexpected operation type: %', operation;
 	end if;
-	perform realtime.send(
+	perform snout_live.signal(
 		jsonb_build_object('old_record', old, 'record', new, 'operation', operation, 'table', table_name, 'schema', table_schema),
 		event_name, topic_name
 	);
@@ -195,15 +195,15 @@ end
 $body$;
 
 -- Who may do what: the API roles read the schema, write broadcasts (their policies on
--- realtime.messages decide which), and read who is subscribed; postgres too, where it exists.
+-- snout_live.signals decide which), and read who is subscribed; postgres too, where it exists.
 do $body$
 declare
-	grantee text := 'anon, authenticated, service_role'
+	grantee text := 'snout_app, snout_member, snout_server'
 		|| case when exists (select 1 from pg_roles where rolname = 'postgres') then ', postgres' else '' end;
 begin
-	execute 'grant usage on schema realtime to ' || grantee;
-	execute 'grant select, insert, update on realtime.messages to ' || grantee;
-	execute 'grant select on realtime.subscription to ' || grantee;
-	execute 'grant usage on sequence realtime.subscription_id_seq to ' || grantee;
+	execute 'grant usage on schema snout_live to ' || grantee;
+	execute 'grant select, insert, update on snout_live.signals to ' || grantee;
+	execute 'grant select on snout_live.listeners to ' || grantee;
+	execute 'grant usage on sequence snout_live.listeners_id_seq to ' || grantee;
 end
 $body$;

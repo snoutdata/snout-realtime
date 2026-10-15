@@ -9,15 +9,18 @@
 //! customer's SELECT policies decide which probe rows come back (read) or their INSERT policies
 //! decide which a subscriber may add (write).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use deadpool_postgres::{Manager, ManagerConfig, RecyclingMethod, Runtime};
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
 
+use crate::layout;
 use crate::tenants::Database;
 
 const SCHEMA: &str = include_str!("../migrations/0001_realtime.sql");
@@ -63,6 +66,137 @@ fn pool_error(e: deadpool_postgres::PoolError) -> DbError {
 	match e {
 		deadpool_postgres::PoolError::Backend(e) => sql_error(e),
 		other => DbError::Unavailable(other.to_string()),
+	}
+}
+
+/// Which names a project's database has (the own layout): one
+/// process serves renamed and unrenamed projects at once, so it asks each database, once, when
+/// its pool is first used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Names {
+	/// `snout_live` when the database has it, else `realtime`.
+	pub schema: String,
+	/// The new role names exist, so a claim in either vocabulary runs as the new one.
+	pub has_new_roles: bool,
+}
+
+impl Default for Names {
+	fn default() -> Self {
+		Self {
+			schema: "realtime".into(),
+			has_new_roles: false,
+		}
+	}
+}
+
+/// What this server's own statements are rewritten for: realtime's tables by their bare names too
+/// (`relname = 'messages'`), never role names, which arrive as parameters.
+const STATEMENTS: layout::Rewrite<'static> = layout::Rewrite {
+	bare: &["realtime"],
+	roles: false,
+};
+
+/// What the migration files are spelled back for: as statements, and the role names they grant to
+/// (`'snout_app, snout_member, snout_server'`), which in an old-layout database are the old ones.
+const MIGRATIONS: layout::Rewrite<'static> = layout::Rewrite {
+	bare: &["realtime"],
+	roles: true,
+};
+
+/// The new layout: `snout_live`, or neither schema yet in a database with the new role names (one
+/// made in the new layout, whose realtime schema this server is about to make). The schema is the
+/// signal for the roles too: roles are the cluster's, so one that exists says nothing about a
+/// database whose schema is the old one.
+const NAMES_SQL: &str = "select schema, schema = 'snout_live' and to_regrole('snout_member') is not null \
+	from (select case when to_regnamespace('snout_live') is not null \
+	or (to_regnamespace('realtime') is null and to_regrole('snout_member') is not null) \
+	then 'snout_live' else 'realtime' end as schema) names";
+
+impl Names {
+	/// The new layout (OWN-LAYOUT 2b): `snout_live`, whose tables are `signals` and `listeners`
+	/// and whose broadcast function is `signal()`. A database has all of the old names or all of
+	/// the new, and the schema says which.
+	pub fn is_new(&self) -> bool {
+		self.schema == "snout_live"
+	}
+
+	/// A statement written with the old names, in this database's. Unchanged (borrowed) in a
+	/// database with the old names.
+	pub fn sql<'a>(&self, text: &'a str) -> Cow<'a, str> {
+		layout::sql_in_layout(text, self.is_new(), STATEMENTS)
+	}
+
+	/// A migration file, as it is run in this database: the files are written in the new names,
+	/// and an old-layout database is given them in its own, role names included.
+	pub fn migration<'a>(&self, text: &'a str) -> Cow<'a, str> {
+		layout::sql_from_new(text, self.is_new(), MIGRATIONS)
+	}
+
+	/// One of realtime's own tables (`messages`, `subscription`) as this database names it.
+	pub fn table<'a>(&self, old: &'a str) -> &'a str {
+		layout::object_in_layout("realtime", old, self.is_new())
+	}
+
+	/// The role to become for a claim in either vocabulary, as the data API becomes it. In a
+	/// database with the new names, the role the claim names, an old name included: there the old
+	/// names are alias roles that inherit the new ones, so a grant written to either behaves the
+	/// same here as through the data API. In one without them, a new name is said as the old one,
+	/// the only one that exists there.
+	pub fn role<'a>(&self, role: &'a str) -> &'a str {
+		layout::role_to_run(role, self.has_new_roles)
+	}
+
+	/// Claims with their `role` as this database names it, for what is stored and checked there.
+	pub fn claims(&self, claims: &Map<String, Value>) -> Map<String, Value> {
+		let mut out = claims.clone();
+		if let Some(Value::String(role)) = out.get_mut("role") {
+			let named = self.role(role).to_string();
+			*role = named;
+		}
+		out
+	}
+}
+
+/// Ask a database which names it has.
+pub async fn names_of(client: &tokio_postgres::Client) -> Result<Names, DbError> {
+	let row = client.query_one(NAMES_SQL, &[]).await.map_err(sql_error)?;
+	Ok(Names {
+		schema: row.get(0),
+		has_new_roles: row.get(1),
+	})
+}
+
+/// A project's pool, and the names its database has (asked once, on first use).
+#[derive(Clone)]
+pub struct Pool {
+	inner: deadpool_postgres::Pool,
+	names: Arc<tokio::sync::OnceCell<Names>>,
+}
+
+impl Deref for Pool {
+	type Target = deadpool_postgres::Pool;
+	fn deref(&self) -> &Self::Target {
+		&self.inner
+	}
+}
+
+impl Pool {
+	pub fn new(inner: deadpool_postgres::Pool) -> Self {
+		Self {
+			inner,
+			names: Arc::new(tokio::sync::OnceCell::new()),
+		}
+	}
+
+	/// The names this database has.
+	pub async fn names(&self) -> Result<Names, DbError> {
+		self.names
+			.get_or_try_init(|| async {
+				let client = self.inner.get().await.map_err(pool_error)?;
+				names_of(&client).await
+			})
+			.await
+			.cloned()
 	}
 }
 
@@ -149,12 +283,13 @@ pub fn new_pool(db: &Database, size: usize) -> Result<Pool, DbError> {
 			recycling_method: RecyclingMethod::Fast,
 		},
 	);
-	Pool::builder(manager)
+	deadpool_postgres::Pool::builder(manager)
 		.max_size(size)
 		.runtime(Runtime::Tokio1)
 		.wait_timeout(Some(Duration::from_secs(10)))
 		.create_timeout(Some(Duration::from_secs(10)))
 		.build()
+		.map(Pool::new)
 		.map_err(|e| DbError::Unavailable(e.to_string()))
 }
 
@@ -163,6 +298,7 @@ pub fn new_pool(db: &Database, size: usize) -> Result<Pool, DbError> {
 /// every project, and made again when their file changes), and today's message partitions.
 /// Run once per project per process, before anything else, one process at a time per project.
 pub async fn prepare(pool: &Pool) -> Result<(), DbError> {
+	let names = pool.names().await?;
 	let mut client = pool.get().await.map_err(pool_error)?;
 	let tx = client.transaction().await.map_err(sql_error)?;
 	tx.execute(
@@ -172,12 +308,17 @@ pub async fn prepare(pool: &Pool) -> Result<(), DbError> {
 	.await
 	.map_err(sql_error)?;
 	let has_schema: bool = tx
-		.query_one("select to_regclass('realtime.messages') is not null", &[])
+		.query_one(
+			&*names.sql("select to_regclass('realtime.messages') is not null"),
+			&[],
+		)
 		.await
 		.map_err(sql_error)?
 		.get(0);
 	if !has_schema {
-		tx.batch_execute(SCHEMA).await.map_err(sql_error)?;
+		tx.batch_execute(&names.migration(SCHEMA))
+			.await
+			.map_err(sql_error)?;
 	}
 	tx.batch_execute(
 		"create schema if not exists snout_realtime;
@@ -186,9 +327,11 @@ pub async fn prepare(pool: &Pool) -> Result<(), DbError> {
 	)
 	.await
 	.map_err(sql_error)?;
+	// The ledger holds the hash of the FILE in either layout, so a database renamed in place keeps
+	// its ledger; what runs is the file in this database's names.
 	for (name, sql) in [("changes", CHANGES), ("handlers", HANDLERS)] {
 		let hash = sha256_hex(sql);
-		let current: Option<String> = tx
+		let mut current: Option<String> = tx
 			.query_opt(
 				"select sha256 from snout_realtime.migrations where name = $1",
 				&[&name],
@@ -196,8 +339,17 @@ pub async fn prepare(pool: &Pool) -> Result<(), DbError> {
 			.await
 			.map_err(sql_error)?
 			.map(|r| r.get(0));
+		// A release before the files were written in the new names recorded the same statements
+		// under another hash: read as today's, so they are not run again for a new comment.
+		if let Some(was) = &current
+			&& let Some(now) = released_as(name, &hash, was)
+		{
+			current = Some(now.to_string());
+		}
 		if current.as_deref() != Some(hash.as_str()) {
-			tx.batch_execute(sql).await.map_err(sql_error)?;
+			tx.batch_execute(&names.migration(sql))
+				.await
+				.map_err(sql_error)?;
 			tx.execute(
 				"insert into snout_realtime.migrations (name, sha256) values ($1, $2)
 				 on conflict (name) do update set sha256 = excluded.sha256, applied_at = now()",
@@ -208,7 +360,32 @@ pub async fn prepare(pool: &Pool) -> Result<(), DbError> {
 		}
 	}
 	tx.commit().await.map_err(sql_error)?;
-	create_partitions(&client).await
+	create_partitions(&client, &names).await
+}
+
+/// The files as an earlier release carried them, by name: (name, the hash of today's file, the
+/// hash the release recorded). Only while today's file is the one in the entry, so a file that
+/// changes after this list was written runs again in every database, as any change does.
+pub const RELEASED_AS: &[(&str, &str, &str)] = &[
+	(
+		"changes",
+		"f4de27da085f64828495df5dc644ff23058b9dcffabbff4926ac6c4cdadc9669",
+		// As released up to 0.1.10: the same statements, written in the old layout's names.
+		"e7fe0b5117817c3a53d5f6dade5e0a2086601220cd720d5fb878e91b8bad8d53",
+	),
+	(
+		"handlers",
+		"ed2b6122e5b617e40d14c6233c95652897b87970dee2f163ac0ad3b8c208ce22",
+		"05c0563f175fd81baf993b0568cb20539e2f4772d97e5616ea0517320685a22b",
+	),
+];
+
+/// Today's hash, when `recorded` is what a release recorded for today's file.
+fn released_as(name: &str, today: &str, recorded: &str) -> Option<&'static str> {
+	RELEASED_AS
+		.iter()
+		.find(|(n, now, was)| *n == name && *now == today && *was == recorded)
+		.map(|(_, now, _)| *now)
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -221,9 +398,12 @@ fn sha256_hex(text: &str) -> String {
 
 /// `realtime.messages_YYYY_MM_DD` from yesterday to three days ahead, as the pinned server
 /// keeps them, so `realtime.send()` always has a partition to land in.
-pub async fn create_partitions(client: &deadpool_postgres::Object) -> Result<(), DbError> {
+pub async fn create_partitions(
+	client: &deadpool_postgres::Object,
+	names: &Names,
+) -> Result<(), DbError> {
 	client
-		.batch_execute(
+		.batch_execute(&names.sql(
 			"do $$
 			declare d date;
 			begin
@@ -235,16 +415,17 @@ pub async fn create_partitions(client: &deadpool_postgres::Object) -> Result<(),
 					end;
 				end loop;
 			end $$",
-		)
+		))
 		.await
 		.map_err(sql_error)
 }
 
 /// Drop partitions older than 72 hours (the pinned server's retention for replay).
 pub async fn drop_old_partitions(pool: &Pool) -> Result<(), DbError> {
+	let names = pool.names().await?;
 	let client = pool.get().await.map_err(pool_error)?;
 	client
-		.batch_execute(
+		.batch_execute(&names.sql(
 			"do $$
 			declare r record;
 			begin
@@ -257,7 +438,7 @@ pub async fn drop_old_partitions(pool: &Pool) -> Result<(), DbError> {
 					end if;
 				end loop;
 			end $$",
-		)
+		))
 		.await
 		.map_err(sql_error)
 }
@@ -284,13 +465,16 @@ fn extensions(presence: bool) -> &'static [&'static str] {
 pub(crate) async fn become_subscriber(
 	tx: &deadpool_postgres::Transaction<'_>,
 	ctx: &AuthContext,
+	names: &Names,
 ) -> Result<(), DbError> {
+	// The claim's role in either vocabulary, as this database names it (`layout.rs`).
+	let role = names.role(&ctx.role);
 	let claims = Value::Object(ctx.claims.clone()).to_string();
 	let headers = Value::Object(ctx.headers.clone()).to_string();
 	let sub = ctx.sub.clone().unwrap_or_default();
 	tx.execute(
 		SET_CONFIG,
-		&[&ctx.role, &ctx.topic, &claims, &sub, &ctx.role, &headers],
+		&[&role, &ctx.topic, &claims, &sub, &role, &headers],
 	)
 	.await
 	.map_err(sql_error)?;
@@ -304,24 +488,29 @@ pub async fn authorize_read(
 	presence: bool,
 	mut policies: Policies,
 ) -> Result<Policies, DbError> {
+	let names = pool.names().await?;
 	let mut client = pool.get().await.map_err(pool_error)?;
 	let tx = client.transaction().await.map_err(sql_error)?;
 	let mut ids = HashMap::new();
 	for ext in extensions(presence) {
 		let row = tx
 			.query_one(
-				"insert into realtime.messages (topic, extension) values ($1, $2) returning id::text",
+				&*names.sql(
+					"insert into realtime.messages (topic, extension) values ($1, $2) returning id::text",
+				),
 				&[&ctx.topic, ext],
 			)
 			.await
 			.map_err(sql_error)?;
 		ids.insert(*ext, row.get::<_, String>(0));
 	}
-	become_subscriber(&tx, ctx).await?;
+	become_subscriber(&tx, ctx, &names).await?;
 	let wanted: Vec<String> = ids.values().cloned().collect();
 	let seen: Vec<String> = tx
 		.query(
-			"select id::text from realtime.messages where topic = $1 and id::text = any($2)",
+			&*names.sql(
+				"select id::text from realtime.messages where topic = $1 and id::text = any($2)",
+			),
 			&[&ctx.topic, &wanted],
 		)
 		.await
@@ -345,15 +534,16 @@ pub async fn authorize_write(
 	extension: &str,
 	mut policies: Policies,
 ) -> Result<Policies, DbError> {
+	let names = pool.names().await?;
 	let mut client = pool.get().await.map_err(pool_error)?;
 	let tx = client.transaction().await.map_err(sql_error)?;
-	become_subscriber(&tx, ctx).await?;
+	become_subscriber(&tx, ctx, &names).await?;
 	tx.batch_execute("savepoint probe")
 		.await
 		.map_err(sql_error)?;
 	let allowed = match tx
 		.execute(
-			"insert into realtime.messages (topic, extension) values ($1, $2)",
+			&*names.sql("insert into realtime.messages (topic, extension) values ($1, $2)"),
 			&[&ctx.topic, &extension],
 		)
 		.await
@@ -379,17 +569,20 @@ pub async fn replay(
 	since_ms: i64,
 	limit: i64,
 ) -> Result<Vec<Stored>, DbError> {
+	let names = pool.names().await?;
 	let client = pool.get().await.map_err(pool_error)?;
 	let limit = limit.clamp(1, 25);
 	let rows = client
 		.query(
-			"select id::text, event, payload from (
+			&*names.sql(
+				"select id::text, event, payload from (
 				select id, event, payload, inserted_at, ctid from realtime.messages
 				where topic = $1 and private is true and extension = 'broadcast'
 				  and inserted_at >= to_timestamp($2::float8 / 1000) at time zone 'utc'
 				  and inserted_at < (now() at time zone 'utc') + interval '1 minute'
 				order by inserted_at desc, ctid desc limit $3
 			) m order by inserted_at, ctid",
+			),
 			&[&topic, &(since_ms as f64), &limit],
 		)
 		.await
@@ -406,3 +599,163 @@ pub async fn replay(
 
 /// Shared handle type.
 pub type Shared = Arc<Databases>;
+
+#[cfg(test)]
+mod names {
+	use super::{CHANGES, HANDLERS, MIGRATIONS, Names, RELEASED_AS, SCHEMA, sha256_hex};
+	use serde_json::Value;
+
+	#[test]
+	fn an_old_database_is_spoken_to_unchanged() {
+		let old = Names::default();
+		let sql = "insert into realtime.messages (topic) values ($1)";
+		assert!(matches!(old.sql(sql), std::borrow::Cow::Borrowed(_)));
+		assert_eq!(old.role("snout_member"), "authenticated");
+		assert_eq!(old.role("anon"), "anon");
+	}
+
+	#[test]
+	fn a_renamed_database_gets_its_own_schema_and_roles() {
+		let new = Names {
+			schema: "snout_live".into(),
+			has_new_roles: true,
+		};
+		assert_eq!(
+			new.sql("delete from realtime.subscription where x; select set_config('realtime.topic', $1, true) from realtime.messages"),
+			"delete from snout_live.listeners where x; select set_config('realtime.topic', $1, true) from snout_live.signals"
+		);
+		assert_eq!(
+			new.sql("row(a, b::realtime.equality_op)::realtime.user_defined_filter, realtime.handlers, format('realtime.%I'), n.nspname = 'realtime'"),
+			"row(a, b::snout_live.equality_op)::snout_live.user_defined_filter, snout_live.handlers, format('snout_live.%I'), n.nspname = 'snout_live'"
+		);
+		assert_eq!(new.table("messages"), "signals");
+		assert_eq!(new.table("subscription"), "listeners");
+		assert_eq!(Names::default().table("messages"), "messages");
+		// As the data API does: the role the claim names, the alias included.
+		assert_eq!(new.role("authenticated"), "authenticated");
+		assert_eq!(new.role("service_role"), "service_role");
+		assert_eq!(new.role("snout_member"), "snout_member");
+		assert_eq!(new.role("my_role"), "my_role");
+		let claims = serde_json::json!({ "role": "authenticated", "sub": "u" });
+		let Some(claims) = claims.as_object() else {
+			panic!("an object")
+		};
+		assert_eq!(
+			Value::Object(new.claims(claims)),
+			Value::Object(claims.clone())
+		);
+		let renamed = serde_json::json!({ "role": "snout_member", "sub": "u" });
+		let Some(renamed) = renamed.as_object() else {
+			panic!("an object")
+		};
+		assert_eq!(
+			Value::Object(new.claims(renamed)),
+			Value::Object(renamed.clone())
+		);
+		assert_eq!(
+			Value::Object(Names::default().claims(renamed)),
+			serde_json::json!({ "role": "authenticated", "sub": "u" })
+		);
+	}
+
+	#[test]
+	fn the_files_are_in_the_new_names_and_spelled_back_for_an_old_database() {
+		let old = Names::default();
+		let new = Names {
+			schema: "snout_live".into(),
+			has_new_roles: true,
+		};
+		for file in [SCHEMA, CHANGES, HANDLERS] {
+			assert!(matches!(new.migration(file), std::borrow::Cow::Borrowed(_)));
+			// Spelled back and over again, the file is itself: nothing is lost on the way.
+			assert_eq!(
+				crate::layout::sql_in_layout(&old.migration(file), true, MIGRATIONS),
+				file
+			);
+		}
+		let back = old.migration(SCHEMA);
+		for made in [
+			"create schema if not exists realtime;",
+			"create table realtime.messages (",
+			"create table realtime.subscription (",
+			"perform realtime.send(",
+			"grantee text := 'anon, authenticated, service_role'",
+			"perform set_config('realtime.topic', topic, true);",
+		] {
+			assert!(back.contains(made), "{made}");
+		}
+		let schema = SCHEMA;
+		for made in [
+			"create schema if not exists snout_live;",
+			"create table snout_live.signals (",
+			"create table snout_live.listeners (",
+			"on snout_live.signals (inserted_at desc, topic)",
+			"create function snout_live.signal(payload jsonb, event text, topic text, private boolean default true)",
+			"create function snout_live.signal(payload bytea, event text, topic text, private boolean default true)",
+			"perform snout_live.signal(",
+			"insert into snout_live.signals (id, payload, event, topic, private, extension)",
+			"perform set_config('realtime.topic', topic, true);",
+			"current_setting('realtime.topic', true)",
+			"grantee text := 'snout_app, snout_member, snout_server'",
+			"'grant usage on schema snout_live to '",
+			"'grant select, insert, update on snout_live.signals to '",
+			"'grant select on snout_live.listeners to '",
+			"'grant usage on sequence snout_live.listeners_id_seq to '",
+			"rolname = 'postgres'",
+		] {
+			assert!(schema.contains(made), "{made}");
+		}
+		let handlers = HANDLERS;
+		assert!(
+			handlers.contains("array['snout_app', 'snout_member', 'snout_server', 'postgres',")
+		);
+		assert!(handlers.contains("array['postgres', 'snout_server',"));
+		assert!(handlers.contains("current_setting('snout_utils.privileged_role', true)"));
+		assert!(handlers.contains("current_setting('realtime.out', true)"));
+		// Outside comments and settings no old name is left in any file.
+		for file in [SCHEMA, CHANGES, HANDLERS] {
+			let statements: String = file
+				.lines()
+				.filter(|l| !l.trim_start().starts_with("--"))
+				.collect::<Vec<_>>()
+				.join("\n");
+			for old in [
+				"realtime.messages",
+				"realtime.subscription",
+				"realtime.send",
+				"realtime.%I",
+				"schema realtime",
+				"'anon'",
+				"'authenticated'",
+				"'service_role'",
+			] {
+				assert!(!statements.contains(old), "{old}");
+			}
+		}
+		// The released hashes stand for today's files only.
+		for (name, today, _) in RELEASED_AS {
+			let file = if *name == "changes" {
+				CHANGES
+			} else {
+				HANDLERS
+			};
+			assert_eq!(
+				sha256_hex(file),
+				*today,
+				"{name} changed since its released hash was listed: drop its RELEASED_AS entry, so \
+				 every database runs it again"
+			);
+		}
+		// The partitions keep their prefix; the parent is the new table.
+		let mut client_side = String::new();
+		client_side.push_str(&new.sql(
+			"execute format('create table if not exists realtime.%I partition of realtime.messages for values from (%L) to (%L)', 'messages_' || d, d, d + 1); \
+			where p.relname = 'messages' and n.nspname = 'realtime' and c.relname ~ '^messages_\\d{4}_\\d{2}_\\d{2}$'",
+		));
+		assert_eq!(
+			client_side,
+			"execute format('create table if not exists snout_live.%I partition of snout_live.signals for values from (%L) to (%L)', 'messages_' || d, d, d + 1); \
+			where p.relname = 'signals' and n.nspname = 'snout_live' and c.relname ~ '^messages_\\d{4}_\\d{2}_\\d{2}$'"
+		);
+	}
+}

@@ -26,7 +26,7 @@ pub const PUBLICATION: &str = "snout_realtime_messages";
 
 /// Run the stream for one project until it fails or the project has had no sockets for a
 /// while. The caller restarts it on the next join.
-pub async fn run(rt: Arc<TenantRt>, pool: deadpool_postgres::Pool, database: Database) {
+pub async fn run(rt: Arc<TenantRt>, pool: crate::db::Pool, database: Database) {
 	loop {
 		match stream(&rt, &pool, &database).await {
 			Ok(()) => return,
@@ -41,7 +41,8 @@ pub async fn run(rt: Arc<TenantRt>, pool: deadpool_postgres::Pool, database: Dat
 	}
 }
 
-async fn ensure_publication(pool: &deadpool_postgres::Pool) -> Result<(), String> {
+async fn ensure_publication(pool: &crate::db::Pool) -> Result<(), String> {
+	let names = pool.names().await.map_err(|e| e.to_string())?;
 	let client = pool.get().await.map_err(|e| e.to_string())?;
 	let sql = format!(
 		"do $$ begin
@@ -52,17 +53,15 @@ async fn ensure_publication(pool: &deadpool_postgres::Pool) -> Result<(), String
 		pub = quote_ident(PUBLICATION)
 	);
 	client
-		.batch_execute(&sql)
+		.batch_execute(&names.sql(&sql))
 		.await
 		.map_err(|e| DbError::from_pg(e).to_string())
 }
 
-async fn stream(
-	rt: &TenantRt,
-	pool: &deadpool_postgres::Pool,
-	database: &Database,
-) -> Result<(), String> {
+async fn stream(rt: &TenantRt, pool: &crate::db::Pool, database: &Database) -> Result<(), String> {
 	ensure_publication(pool).await?;
+	// The table broadcasts land in, as this database names it.
+	let names = pool.names().await.map_err(|e| e.to_string())?;
 	let target = Target {
 		host: database.host.clone(),
 		port: database.port,
@@ -118,8 +117,8 @@ async fn stream(
 					}
 					Message::Insert { relation, new } => {
 						if let Some(r) = relations.get(&relation)
-							&& r.schema == "realtime"
-							&& r.name == "messages"
+							&& r.schema == names.schema
+							&& r.name == names.table("messages")
 						{
 							broadcast_row(rt, r, &new);
 						}

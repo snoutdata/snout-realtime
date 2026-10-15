@@ -52,8 +52,10 @@ async fn database() -> Option<Client> {
 		)
 		.await
 		.unwrap();
-	client.batch_execute(SCHEMA).await.unwrap();
-	client.batch_execute(CHANGES).await.unwrap();
+	// A database in the old layout, as this test's roles and policies are: the files spelled back.
+	let old = snout_realtime::db::Names::default();
+	client.batch_execute(&old.migration(SCHEMA)).await.unwrap();
+	client.batch_execute(&old.migration(CHANGES)).await.unwrap();
 	client
 		.batch_execute(
 			"create table public.items (id bigint generated always as identity primary key, owner uuid, room text, title text);

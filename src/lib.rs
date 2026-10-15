@@ -15,6 +15,7 @@ pub mod handlers;
 pub mod hub;
 pub mod inspect;
 pub mod jwt;
+pub mod layout;
 pub mod messages;
 pub mod pgoutput;
 pub mod presence;
@@ -24,6 +25,7 @@ pub mod sio;
 pub mod socket;
 pub mod socketio;
 pub mod tenants;
+pub mod vocabulary;
 
 /// Everything a request needs.
 pub struct App {
@@ -55,8 +57,10 @@ pub async fn upkeep(app: std::sync::Arc<App>) {
 			let Ok(pool) = app.dbs.pool(&tenant.external_id, &database).await else {
 				continue;
 			};
-			if let Ok(client) = pool.get().await {
-				let _ = db::create_partitions(&client).await;
+			if let Ok(names) = pool.names().await
+				&& let Ok(client) = pool.get().await
+			{
+				let _ = db::create_partitions(&client, &names).await;
 			}
 			let _ = db::drop_old_partitions(&pool).await;
 		}

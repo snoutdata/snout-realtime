@@ -20,7 +20,9 @@ use crate::db::{self, AuthContext, Policies};
 use crate::hub::{self, Inbox, Out, Outbox, Sub, TenantRt, TopicKey};
 use crate::inspect::{self, Event, Kind};
 use crate::jwt;
+use crate::layout::Vocabulary;
 use crate::protocol::{self, Frame, Inbound, InboundPayload, Vsn};
+use crate::vocabulary;
 
 /// How often a channel re-checks its token, at most (the pinned server's five minutes).
 const CONFIRM_TOKEN_EVERY: Duration = Duration::from_secs(300);
@@ -148,10 +150,7 @@ pub fn now_secs() -> i64 {
 }
 
 /// A project's pool, its schema prepared on first use (once per project per process).
-pub async fn project_pool(
-	app: &Arc<App>,
-	rt: &Arc<TenantRt>,
-) -> Result<deadpool_postgres::Pool, String> {
+pub async fn project_pool(app: &Arc<App>, rt: &Arc<TenantRt>) -> Result<crate::db::Pool, String> {
 	let tenant = rt.tenant();
 	let Some(database) = tenant.database.clone() else {
 		return Err(
@@ -239,6 +238,9 @@ struct Socket {
 	closed: Closed,
 	/// Frames waiting to go out.
 	out: Vec<Frame>,
+	/// Topics (in their old form) this client joined as `live:<n>`, so what is sent on them is
+	/// spoken in the new vocabulary (`vocabulary.rs`).
+	speaks_new: HashSet<String>,
 }
 
 pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
@@ -261,6 +263,7 @@ pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 		channels: HashMap::new(),
 		closed: Closed::default(),
 		out: Vec::new(),
+		speaks_new: HashSet::new(),
 	};
 	let (mut sink, mut stream) = ws.split();
 	let mut last_inbound = Instant::now();
@@ -282,13 +285,13 @@ pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 				match incoming {
 					Some(Ok(WsMessage::Text(text))) => {
 						match protocol::decode_text(s.vsn, text.as_str()) {
-							Ok(m) => s.handle(m).await,
+							Ok(m) => s.hear(m).await,
 							Err(e) => tracing::debug!(error = %e, "an undecodable frame"),
 						}
 					}
 					Some(Ok(WsMessage::Binary(bytes))) if s.vsn == Vsn::V2 => {
 						match protocol::decode_binary(&bytes) {
-							Ok(m) => s.handle(m).await,
+							Ok(m) => s.hear(m).await,
 							Err(e) => tracing::debug!(error = %e, "an undecodable frame"),
 						}
 					}
@@ -332,9 +335,10 @@ pub async fn serve(app: Arc<App>, ws: WebSocket, accepted: Accepted) {
 				break;
 			}
 		}
+		let speaks_new = &s.speaks_new;
 		let written = write_frames(
 			&mut sink,
-			s.out.drain(..),
+			s.out.drain(..).map(|f| vocabulary::speak(f, speaks_new)),
 			&s.rt.counters.output_bytes,
 			WRITE_TIMEOUT,
 		)
@@ -389,6 +393,24 @@ where
 }
 
 impl Socket {
+	/// A client's message in either vocabulary, handled in the old one. A join records which one
+	/// the client spoke, and that is the one it is answered in on that topic.
+	async fn hear(&mut self, m: Inbound) {
+		let (m, spoken) = vocabulary::hear(m);
+		if m.event == "phx_join" {
+			match spoken {
+				Some(Vocabulary::New) => {
+					self.speaks_new.insert(m.topic.clone());
+				}
+				Some(Vocabulary::Old) => {
+					self.speaks_new.remove(&m.topic);
+				}
+				None => {}
+			}
+		}
+		self.handle(m).await;
+	}
+
 	fn push(&mut self, frame: Frame) {
 		self.out.push(frame);
 	}
@@ -759,7 +781,7 @@ impl Socket {
 		ensure_messages(&self.app, &self.rt).await;
 	}
 
-	async fn pool(&self) -> Result<deadpool_postgres::Pool, String> {
+	async fn pool(&self) -> Result<crate::db::Pool, String> {
 		project_pool(&self.app, &self.rt).await
 	}
 

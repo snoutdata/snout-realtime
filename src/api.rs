@@ -201,7 +201,11 @@ pub(crate) async fn admit(
 /// which is the owner's to read and never a stranger's holding the anon key from a web page.
 async fn owner(app: &App, headers: &HeaderMap) -> Result<Arc<tenants::Tenant>, Box<Response>> {
 	let (tenant, claims) = http_caller(app, headers).await?;
-	if claims.get("role").and_then(Value::as_str) != Some("service_role") {
+	if !claims
+		.get("role")
+		.and_then(Value::as_str)
+		.is_some_and(crate::layout::is_server)
+	{
 		return Err(Box::new(json_response(
 			StatusCode::FORBIDDEN,
 			json!({ "message": "Inspecting Realtime needs the project's service_role key" }),
